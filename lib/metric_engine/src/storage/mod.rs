@@ -1,11 +1,22 @@
 pub mod backend;
 pub mod duckdb_impl;
 
-use crate::core::{Metric, MetricSample, TickLedger, TimeSeriesBuffer, TsdbStorage};
+use crate::core::{Metric, MetricSample, TickLedger, TimeSeriesBuffer};
 pub use backend::{NoopStorageBackend, StorageBackend};
 pub use duckdb_impl::DuckDbBackend;
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
+use tracing::{debug, info};
+
+pub trait TsdbStorage: Metric {
+    fn table_name() -> &'static str;
+    fn schema_columns() -> &'static [&'static str];
+    fn create_table_sql() -> &'static str;
+    fn insert_sql() -> &'static str;
+    fn select_range_sql() -> &'static str;
+    fn to_sql_params(&self) -> Vec<String>;
+    fn from_sql_row(row_params: &[&str]) -> Result<Self, String>;
+}
 
 pub trait StorageBufferTrait: Send + Sync {
     fn clone_to_any(&self) -> Box<dyn Any + Send + Sync>;
@@ -130,6 +141,7 @@ pub struct StorageEngine {
 
 impl StorageEngine {
     pub fn new(flush_interval_ms: i64, backend: Box<dyn StorageBackend>) -> Self {
+        debug!(flush_interval_ms, "initializing metric storage engine");
         Self {
             buffers: HashMap::new(),
             flush_watermarks: HashMap::new(),
@@ -140,6 +152,7 @@ impl StorageEngine {
     }
 
     pub fn register_buffer<T: TsdbStorage>(&mut self, capacity: usize) {
+        debug!(metric_type = ?TypeId::of::<T>(), capacity, persistent = true, "registering metric buffer");
         self.buffers.insert(
             TypeId::of::<T>(),
             Box::new(PersistentBuffer {
@@ -151,6 +164,7 @@ impl StorageEngine {
     }
 
     pub fn register_ephemeral_buffer<T: Metric>(&mut self, capacity: usize) {
+        debug!(metric_type = ?TypeId::of::<T>(), capacity, persistent = false, "registering metric buffer");
         self.buffers.insert(
             TypeId::of::<T>(),
             Box::new(EphemeralBuffer {
@@ -166,6 +180,11 @@ impl StorageEngine {
         timestamp_ms: i64,
         demand: &HashSet<crate::core::MetricDependency>,
     ) -> TickLedger {
+        debug!(
+            timestamp_ms,
+            dependency_count = demand.len(),
+            "provisioning metric tick ledger"
+        );
         let mut ledger = TickLedger::new(timestamp_ms);
 
         for dep in demand {
@@ -178,8 +197,19 @@ impl StorageEngine {
     }
 
     pub fn commit_sample<T: Metric>(&mut self, sample: MetricSample<T>) {
-        if let Some(buf) = self.buffers.get_mut(&TypeId::of::<T>()) {
+        let metric_type = TypeId::of::<T>();
+        debug!(
+            ?metric_type,
+            timestamp_ms = sample.timestamp_ms,
+            "committing metric sample to buffer"
+        );
+        if let Some(buf) = self.buffers.get_mut(&metric_type) {
             buf.commit_any(Box::new(sample));
+        } else {
+            debug!(
+                ?metric_type,
+                "discarding sample because no metric buffer is registered"
+            );
         }
     }
 
@@ -196,8 +226,16 @@ impl StorageEngine {
             return Ok(());
         }
 
+        info!(
+            timestamp_ms,
+            previous_flush_timestamp_ms = self.last_flush_timestamp_ms,
+            buffer_count = self.buffers.len(),
+            "flushing metric storage buffers"
+        );
+        let mut flushed_buffer_count = 0;
         for (id, buf) in self.buffers.iter_mut() {
             if !buf.is_ephemeral() {
+                flushed_buffer_count += 1;
                 let watermark = *self.flush_watermarks.get(id).unwrap_or(&0);
 
                 let next = buf.flush_new_samples(watermark, self.backend.as_mut())?;
@@ -207,6 +245,7 @@ impl StorageEngine {
         }
 
         self.last_flush_timestamp_ms = timestamp_ms;
+        info!(flushed_buffer_count, "metric storage flush completed");
 
         Ok(())
     }

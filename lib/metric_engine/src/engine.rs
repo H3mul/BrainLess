@@ -1,8 +1,10 @@
 use crate::core::{ExternalMetric, Metric, MetricEvaluator, MetricGroup, MetricSample};
 use crate::dag::{CompiledSessionResources, DagCompiler, ExecutionMode};
 use crate::storage::{NoopStorageBackend, StorageBackend, StorageEngine};
+use crate::TsdbStorage;
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
+use tracing::{debug, info, warn};
 
 pub struct TickOutputs {
     pub timestamp_ms: i64,
@@ -67,15 +69,13 @@ impl MetricEngineBuilder {
     where
         E::Output: MetricGroup,
     {
+        debug!(evaluator = evaluator.id(), "registering metric evaluator");
         self.evaluators.push(Box::new(evaluator));
 
         self
     }
 
-    pub fn register_persistent_metric<T: crate::core::TsdbStorage>(
-        mut self,
-        capacity: usize,
-    ) -> Self {
+    pub fn register_persistent_metric<T: TsdbStorage>(mut self, capacity: usize) -> Self {
         self.registrations
             .push(Box::new(move |s| s.register_buffer::<T>(capacity)));
 
@@ -109,13 +109,25 @@ impl MetricEngineBuilder {
     }
 
     pub fn build(self) -> Result<MetricEngine, String> {
+        info!(
+            evaluator_count = self.evaluators.len(),
+            target_count = self.target_metrics.len(),
+            buffer_registration_count = self.registrations.len(),
+            flush_interval_ms = self.flush_interval_ms,
+            has_storage_backend = self.storage_backend.is_some(),
+            "building metric engine"
+        );
         let targets = self.target_metrics.iter().copied().collect();
 
         let resources = DagCompiler::compile(
             &self.target_metrics,
             self.evaluators,
             ExecutionMode::Sequential,
-        )?;
+        )
+        .map_err(|error| {
+            warn!(%error, "metric engine DAG compilation failed");
+            error
+        })?;
 
         let backend = self
             .storage_backend
@@ -127,6 +139,11 @@ impl MetricEngineBuilder {
             registration(&mut storage);
         }
 
+        info!(
+            dependency_count = resources.aggregate_demand.len(),
+            buffer_count = resources.ram_buffer_capacities.len(),
+            "metric engine built"
+        );
         Ok(MetricEngine {
             storage,
             resources,
@@ -147,6 +164,11 @@ impl MetricEngine {
     }
 
     pub fn ingest_external_sample<T: ExternalMetric>(&mut self, timestamp_ms: i64, data: T) {
+        debug!(
+            metric_type = ?TypeId::of::<T>(),
+            timestamp_ms,
+            "ingesting external metric sample"
+        );
         self.storage
             .commit_sample(MetricSample { timestamp_ms, data });
     }
@@ -156,15 +178,24 @@ impl MetricEngine {
     }
 
     pub fn tick(&mut self, timestamp_ms: i64) -> Result<TickOutputs, String> {
+        debug!(timestamp_ms, "starting metric engine tick");
         let mut ledger = self
             .storage
             .provision_ledger(timestamp_ms, &self.resources.aggregate_demand);
 
-        self.resources
-            .execution_plan
-            .execute(&mut ledger, &mut self.storage, timestamp_ms)?;
+        if let Err(error) =
+            self.resources
+                .execution_plan
+                .execute(&mut ledger, &mut self.storage, timestamp_ms)
+        {
+            warn!(timestamp_ms, %error, "metric engine evaluator execution failed");
+            return Err(error);
+        }
 
-        self.storage.maybe_flush(timestamp_ms)?;
+        if let Err(error) = self.storage.maybe_flush(timestamp_ms) {
+            warn!(timestamp_ms, %error, "metric engine storage flush failed");
+            return Err(error);
+        }
 
         let mut output = TickOutputs::new(timestamp_ms);
 
@@ -174,6 +205,11 @@ impl MetricEngine {
             }
         }
 
+        debug!(
+            timestamp_ms,
+            output_count = output.outputs.len(),
+            "completed metric engine tick"
+        );
         Ok(output)
     }
 }

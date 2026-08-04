@@ -5,16 +5,6 @@ pub trait Metric: Send + Sync + Clone + 'static {}
 
 pub trait ExternalMetric: Metric {}
 
-pub trait TsdbStorage: Metric {
-    fn table_name() -> &'static str;
-    fn schema_columns() -> &'static [&'static str];
-    fn create_table_sql() -> &'static str;
-    fn insert_sql() -> &'static str;
-    fn select_range_sql() -> &'static str;
-    fn to_sql_params(&self) -> Vec<String>;
-    fn from_sql_row(row_params: &[&str]) -> Result<Self, String>;
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SampleRate {
     Best,
@@ -121,7 +111,6 @@ impl<T: Metric> TimeSeriesBuffer<T> {
 }
 
 #[derive(Default)]
-
 pub struct TickLedger {
     pub timestamp_ms: i64,
     store: HashMap<TypeId, Box<dyn Any + Send + Sync>>,

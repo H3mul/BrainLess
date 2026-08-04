@@ -2,6 +2,7 @@ use crate::core::{Age, AgeRange, ErasedEvaluator, MetricDependency, TickLedger};
 use crate::storage::StorageEngine;
 use std::any::TypeId;
 use std::collections::{HashMap, HashSet, VecDeque};
+use tracing::{debug, info, warn};
 
 pub enum ExecutionMode {
     Sequential,
@@ -24,9 +25,14 @@ impl ExecutionPlan {
         storage: &mut StorageEngine,
         timestamp_ms: i64,
     ) -> Result<(), String> {
+        debug!(
+            evaluator_count = self.sequence.len(),
+            timestamp_ms, "executing metric evaluation plan"
+        );
         match self.mode {
             ExecutionMode::Sequential => {
                 for e in &self.sequence {
+                    debug!(evaluator = e.id(), timestamp_ms, "evaluating metric");
                     e.evaluate_and_commit(ledger, storage, timestamp_ms)?;
 
                     for type_id in e.produces() {
@@ -36,7 +42,10 @@ impl ExecutionPlan {
                     }
                 }
             }
-            ExecutionMode::Parallel => return Err("Parallel execution is not implemented".into()),
+            ExecutionMode::Parallel => {
+                warn!("parallel metric evaluation was requested but is not implemented");
+                return Err("Parallel execution is not implemented".into());
+            }
         }
 
         Ok(())
@@ -57,12 +66,19 @@ impl DagCompiler {
         evaluators: Vec<Box<dyn ErasedEvaluator>>,
         mode: ExecutionMode,
     ) -> Result<CompiledSessionResources, String> {
+        info!(
+            target_count = targets.len(),
+            evaluator_count = evaluators.len(),
+            "compiling metric dependency graph"
+        );
         let mut producers = HashMap::new();
 
         for (i, e) in evaluators.iter().enumerate() {
             for ty in e.produces() {
                 if producers.insert(ty, i).is_some() {
-                    return Err(format!("Multiple evaluators produce metric type {:?}", ty));
+                    let error = format!("Multiple evaluators produce metric type {:?}", ty);
+                    warn!(%error, "metric dependency graph has duplicate producer");
+                    return Err(error);
                 }
             }
         }
@@ -142,7 +158,9 @@ impl DagCompiler {
         }
 
         if order.len() != n {
-            return Err("Cyclic dependency detected in selected evaluators graph".into());
+            let error = "Cyclic dependency detected in selected evaluators graph";
+            warn!(%error, selected_evaluator_count = n, "metric dependency graph contains a cycle");
+            return Err(error.into());
         }
 
         let mut ordered: Vec<Option<Box<dyn ErasedEvaluator>>> =
@@ -177,6 +195,12 @@ impl DagCompiler {
             }
         }
 
+        info!(
+            selected_evaluator_count = sequence.len(),
+            dependency_count = demand.len(),
+            buffer_count = caps.len(),
+            "metric dependency graph compiled"
+        );
         Ok(CompiledSessionResources {
             execution_plan: ExecutionPlan::new(sequence, mode),
             ram_buffer_capacities: caps,

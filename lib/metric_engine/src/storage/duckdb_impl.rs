@@ -1,4 +1,5 @@
 use crate::StorageBackend;
+use tracing::{debug, info};
 
 /// DuckDB adapter boundary. A production application can replace the simple
 /// connection handle with duckdb::Connection without changing the engine.
@@ -25,6 +26,13 @@ impl StorageBackend for DuckDbBackend {
         rows: &[String],
     ) -> Result<(), String> {
         self.flushed_rows += rows.len();
+        info!(
+            database = %self.database_path,
+            table,
+            row_count = rows.len(),
+            "flushing metric rows to DuckDB backend"
+        );
+        debug!(columns = ?columns, "DuckDB flush schema");
 
         println!(
             "DuckDB {}: flushed {} rows into {} ({})",
@@ -38,6 +46,12 @@ impl StorageBackend for DuckDbBackend {
     }
 
     fn fetch_historic(&self, table: &str, window_ms: i64) -> Result<Vec<String>, String> {
+        debug!(
+            database = %self.database_path,
+            table,
+            window_ms,
+            "fetching historic metric rows from DuckDB backend"
+        );
         println!(
             "DuckDB {}: fetch {}ms from {}",
             self.database_path, window_ms, table
