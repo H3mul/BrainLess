@@ -1,0 +1,3 @@
+[workspace]
+members = ["lib/metric_engine", "lib/bci_metrics"]
+resolver = "2"

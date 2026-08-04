@@ -1,0 +1,213 @@
+pub mod backend;
+pub mod duckdb_impl;
+
+use crate::core::{Metric, MetricSample, TickLedger, TimeSeriesBuffer, TsdbStorage};
+pub use backend::{NoopStorageBackend, StorageBackend};
+pub use duckdb_impl::DuckDbBackend;
+use std::any::{Any, TypeId};
+use std::collections::{HashMap, HashSet};
+
+pub trait StorageBufferTrait: Send + Sync {
+    fn clone_to_any(&self) -> Box<dyn Any + Send + Sync>;
+
+    fn commit_any(&mut self, sample: Box<dyn Any + Send + Sync>);
+
+    fn flush_new_samples(
+        &mut self,
+        watermark: i64,
+        backend: &mut dyn StorageBackend,
+    ) -> Result<i64, String>;
+
+    fn is_ephemeral(&self) -> bool;
+
+    fn latest_erased(&self) -> Option<Box<dyn Any + Send + Sync>>;
+
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+pub struct PersistentBuffer<T: TsdbStorage> {
+    pub buffer: TimeSeriesBuffer<T>,
+}
+
+impl<T: TsdbStorage> StorageBufferTrait for PersistentBuffer<T> {
+    fn clone_to_any(&self) -> Box<dyn Any + Send + Sync> {
+        Box::new(self.buffer.clone())
+    }
+
+    fn commit_any(&mut self, sample: Box<dyn Any + Send + Sync>) {
+        if let Ok(sample) = sample.downcast::<MetricSample<T>>() {
+            self.buffer.push_sample(*sample);
+        }
+    }
+
+    fn flush_new_samples(
+        &mut self,
+        watermark: i64,
+        backend: &mut dyn StorageBackend,
+    ) -> Result<i64, String> {
+        let samples: Vec<_> = self
+            .buffer
+            .as_slice()
+            .iter()
+            .filter(|s| s.timestamp_ms > watermark)
+            .cloned()
+            .collect();
+
+        if samples.is_empty() {
+            return Ok(watermark);
+        }
+
+        let rows: Vec<_> = samples
+            .iter()
+            .map(|s| format!("{},{}", s.timestamp_ms, s.data.to_sql_params().join(",")))
+            .collect();
+
+        backend.flush_batch(T::table_name(), T::schema_columns(), &rows)?;
+
+        Ok(samples
+            .iter()
+            .map(|s| s.timestamp_ms)
+            .max()
+            .unwrap_or(watermark))
+    }
+
+    fn is_ephemeral(&self) -> bool {
+        false
+    }
+
+    fn latest_erased(&self) -> Option<Box<dyn Any + Send + Sync>> {
+        self.buffer.latest().cloned().map(|s| Box::new(s) as _)
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+pub struct EphemeralBuffer<T: Metric> {
+    pub buffer: TimeSeriesBuffer<T>,
+}
+
+impl<T: Metric> StorageBufferTrait for EphemeralBuffer<T> {
+    fn clone_to_any(&self) -> Box<dyn Any + Send + Sync> {
+        Box::new(self.buffer.clone())
+    }
+
+    fn commit_any(&mut self, sample: Box<dyn Any + Send + Sync>) {
+        if let Ok(sample) = sample.downcast::<MetricSample<T>>() {
+            self.buffer.push_sample(*sample);
+        }
+    }
+
+    fn flush_new_samples(
+        &mut self,
+        watermark: i64,
+        _: &mut dyn StorageBackend,
+    ) -> Result<i64, String> {
+        Ok(watermark)
+    }
+
+    fn is_ephemeral(&self) -> bool {
+        true
+    }
+
+    fn latest_erased(&self) -> Option<Box<dyn Any + Send + Sync>> {
+        self.buffer.latest().cloned().map(|s| Box::new(s) as _)
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+pub struct StorageEngine {
+    buffers: HashMap<TypeId, Box<dyn StorageBufferTrait>>,
+    flush_watermarks: HashMap<TypeId, i64>,
+    last_flush_timestamp_ms: i64,
+    flush_interval_ms: i64,
+    backend: Box<dyn StorageBackend>,
+}
+
+impl StorageEngine {
+    pub fn new(flush_interval_ms: i64, backend: Box<dyn StorageBackend>) -> Self {
+        Self {
+            buffers: HashMap::new(),
+            flush_watermarks: HashMap::new(),
+            last_flush_timestamp_ms: 0,
+            flush_interval_ms,
+            backend,
+        }
+    }
+
+    pub fn register_buffer<T: TsdbStorage>(&mut self, capacity: usize) {
+        self.buffers.insert(
+            TypeId::of::<T>(),
+            Box::new(PersistentBuffer {
+                buffer: TimeSeriesBuffer::<T>::with_capacity(capacity),
+            }),
+        );
+
+        self.flush_watermarks.insert(TypeId::of::<T>(), 0);
+    }
+
+    pub fn register_ephemeral_buffer<T: Metric>(&mut self, capacity: usize) {
+        self.buffers.insert(
+            TypeId::of::<T>(),
+            Box::new(EphemeralBuffer {
+                buffer: TimeSeriesBuffer::<T>::with_capacity(capacity),
+            }),
+        );
+
+        self.flush_watermarks.insert(TypeId::of::<T>(), 0);
+    }
+
+    pub fn provision_ledger(
+        &self,
+        timestamp_ms: i64,
+        demand: &HashSet<crate::core::MetricDependency>,
+    ) -> TickLedger {
+        let mut ledger = TickLedger::new(timestamp_ms);
+
+        for dep in demand {
+            if let Some(buf) = self.buffers.get(&dep.type_id) {
+                ledger.insert_erased(dep.type_id, buf.clone_to_any());
+            }
+        }
+
+        ledger
+    }
+
+    pub fn commit_sample<T: Metric>(&mut self, sample: MetricSample<T>) {
+        if let Some(buf) = self.buffers.get_mut(&TypeId::of::<T>()) {
+            buf.commit_any(Box::new(sample));
+        }
+    }
+
+    pub fn series_erased(&self, id: TypeId) -> Option<Box<dyn Any + Send + Sync>> {
+        self.buffers.get(&id).map(|b| b.clone_to_any())
+    }
+
+    pub fn latest_erased(&self, id: TypeId) -> Option<Box<dyn Any + Send + Sync>> {
+        self.buffers.get(&id).and_then(|b| b.latest_erased())
+    }
+
+    pub fn maybe_flush(&mut self, timestamp_ms: i64) -> Result<(), String> {
+        if timestamp_ms - self.last_flush_timestamp_ms < self.flush_interval_ms {
+            return Ok(());
+        }
+
+        for (id, buf) in self.buffers.iter_mut() {
+            if !buf.is_ephemeral() {
+                let watermark = *self.flush_watermarks.get(id).unwrap_or(&0);
+
+                let next = buf.flush_new_samples(watermark, self.backend.as_mut())?;
+
+                self.flush_watermarks.insert(*id, next);
+            }
+        }
+
+        self.last_flush_timestamp_ms = timestamp_ms;
+
+        Ok(())
+    }
+}
