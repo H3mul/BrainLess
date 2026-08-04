@@ -2,6 +2,7 @@ use crate::metrics::{FaaMetric, RawEegMetric};
 use metric_engine::{MetricDependency, MetricEvaluator, TickLedger};
 use std::collections::HashSet;
 
+/// Computes frontal alpha asymmetry from the latest raw EEG sample.
 pub struct FaaEvaluator;
 
 impl MetricEvaluator for FaaEvaluator {

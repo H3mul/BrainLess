@@ -1,17 +1,19 @@
+use crate::TsdbStorage;
 use crate::core::{ExternalMetric, Metric, MetricEvaluator, MetricGroup, MetricSample};
 use crate::dag::{CompiledSessionResources, DagCompiler, ExecutionMode};
 use crate::storage::{NoopStorageBackend, StorageBackend, StorageEngine};
-use crate::TsdbStorage;
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, info, warn};
 
+/// Target metric values produced by one engine tick.
 pub struct TickOutputs {
     pub timestamp_ms: i64,
     outputs: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
 }
 
 impl TickOutputs {
+    /// Creates an empty output set for a tick timestamp.
     pub fn new(timestamp_ms: i64) -> Self {
         Self {
             timestamp_ms,
@@ -19,20 +21,24 @@ impl TickOutputs {
         }
     }
 
+    /// Inserts a type-erased target sample.
     pub fn insert_erased(&mut self, id: TypeId, value: Box<dyn Any + Send + Sync>) {
         self.outputs.insert(id, value);
     }
 
+    /// Retrieves the typed target sample for `T`.
     pub fn get<T: Metric>(&self) -> Option<&MetricSample<T>> {
         self.outputs
             .get(&TypeId::of::<T>())
             .and_then(|v| v.downcast_ref())
     }
 
+    /// Retrieves only the typed metric value for `T`.
     pub fn get_data<T: Metric>(&self) -> Option<&T> {
         self.get::<T>().map(|s| &s.data)
     }
 
+    /// Alias for retrieving the latest typed target value.
     pub fn get_latest<T: Metric>(&self) -> Option<&T> {
         self.get_data::<T>()
     }
@@ -40,6 +46,7 @@ impl TickOutputs {
 
 type BufferRegistration = Box<dyn FnOnce(&mut StorageEngine) + Send>;
 
+/// Configures evaluators, buffers, targets, and persistence before compilation.
 pub struct MetricEngineBuilder {
     evaluators: Vec<Box<dyn crate::core::ErasedEvaluator>>,
     target_metrics: Vec<TypeId>,
@@ -55,6 +62,7 @@ impl Default for MetricEngineBuilder {
 }
 
 impl MetricEngineBuilder {
+    /// Creates an empty builder with a 20-second default flush interval.
     pub fn new() -> Self {
         Self {
             evaluators: Vec::new(),
@@ -65,6 +73,7 @@ impl MetricEngineBuilder {
         }
     }
 
+    /// Registers an application evaluator for DAG compilation.
     pub fn register_evaluator<E: MetricEvaluator + 'static>(mut self, evaluator: E) -> Self
     where
         E::Output: MetricGroup,
@@ -75,6 +84,7 @@ impl MetricEngineBuilder {
         self
     }
 
+    /// Registers a metric whose new samples are sent to the backend.
     pub fn register_persistent_metric<T: TsdbStorage>(mut self, capacity: usize) -> Self {
         self.registrations
             .push(Box::new(move |s| s.register_buffer::<T>(capacity)));
@@ -82,6 +92,7 @@ impl MetricEngineBuilder {
         self
     }
 
+    /// Registers a metric retained in memory without persistence.
     pub fn register_ephemeral_metric<T: Metric>(mut self, capacity: usize) -> Self {
         self.registrations.push(Box::new(move |s| {
             s.register_ephemeral_buffer::<T>(capacity)
@@ -90,24 +101,28 @@ impl MetricEngineBuilder {
         self
     }
 
+    /// Supplies the application-owned persistence backend.
     pub fn with_storage(mut self, backend: impl StorageBackend + 'static) -> Self {
         self.storage_backend = Some(Box::new(backend));
 
         self
     }
 
+    /// Selects the metric types returned from each tick.
     pub fn with_targets(mut self, targets: Vec<TypeId>) -> Self {
         self.target_metrics = targets;
 
         self
     }
 
+    /// Sets the persistence flush interval in milliseconds.
     pub fn with_flush_interval_ms(mut self, interval: i64) -> Self {
         self.flush_interval_ms = interval;
 
         self
     }
 
+    /// Compiles the dependency graph and creates a runnable engine.
     pub fn build(self) -> Result<MetricEngine, String> {
         info!(
             evaluator_count = self.evaluators.len(),
@@ -152,6 +167,7 @@ impl MetricEngineBuilder {
     }
 }
 
+/// Orchestrates ingestion, ledger provisioning, DAG evaluation, and storage flushes.
 pub struct MetricEngine {
     storage: StorageEngine,
     resources: CompiledSessionResources,
@@ -159,10 +175,12 @@ pub struct MetricEngine {
 }
 
 impl MetricEngine {
+    /// Starts a declarative engine configuration.
     pub fn builder() -> MetricEngineBuilder {
         MetricEngineBuilder::new()
     }
 
+    /// Ingests a sample from hardware or another external source.
     pub fn ingest_external_sample<T: ExternalMetric>(&mut self, timestamp_ms: i64, data: T) {
         debug!(
             metric_type = ?TypeId::of::<T>(),
@@ -173,10 +191,12 @@ impl MetricEngine {
             .commit_sample(MetricSample { timestamp_ms, data });
     }
 
+    /// Convenience alias for `ingest_external_sample`.
     pub fn feed_external<T: ExternalMetric>(&mut self, timestamp_ms: i64, data: T) {
         self.ingest_external_sample(timestamp_ms, data)
     }
 
+    /// Executes one evaluation tick and returns the configured target outputs.
     pub fn tick(&mut self, timestamp_ms: i64) -> Result<TickOutputs, String> {
         debug!(timestamp_ms, "starting metric engine tick");
         let mut ledger = self

@@ -1,11 +1,13 @@
 use metric_engine::{Metric, TsdbStorage};
 
+/// Aggregate volatility of the recent frontal alpha asymmetry series.
 #[derive(Clone, Debug)]
 pub struct FaaVolatilityMetric {
     pub volatility: f32,
 }
 impl Metric for FaaVolatilityMetric {}
 
+/// DuckDB schema and row conversion for FAA volatility.
 impl TsdbStorage for FaaVolatilityMetric {
     fn table_name() -> &'static str {
         "metrics_faa_volatility"

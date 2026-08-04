@@ -1,11 +1,13 @@
 use metric_engine::{Metric, TsdbStorage};
 
+/// Frontal alpha asymmetry derived from the AF7 and AF8 channels.
 #[derive(Clone, Debug)]
 pub struct FaaMetric {
     pub faa: f32,
 }
 impl Metric for FaaMetric {}
 
+/// DuckDB schema and row conversion for frontal alpha asymmetry.
 impl TsdbStorage for FaaMetric {
     fn table_name() -> &'static str {
         "metrics_faa"

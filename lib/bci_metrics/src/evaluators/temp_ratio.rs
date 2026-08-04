@@ -2,6 +2,7 @@ use crate::metrics::{FaaMetric, TempRatioMetric};
 use metric_engine::{MetricDependency, MetricEvaluator, TickLedger};
 use std::collections::HashSet;
 
+/// Computes the experimental temporary ratio from the latest FAA sample.
 pub struct TempRatioEvaluator;
 
 impl MetricEvaluator for TempRatioEvaluator {

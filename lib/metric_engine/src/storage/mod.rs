@@ -18,6 +18,7 @@ pub trait TsdbStorage: Metric {
     fn from_sql_row(row_params: &[&str]) -> Result<Self, String>;
 }
 
+/// Type-erased buffer operations used by `StorageEngine`.
 pub trait StorageBufferTrait: Send + Sync {
     fn clone_to_any(&self) -> Box<dyn Any + Send + Sync>;
 
@@ -36,6 +37,7 @@ pub trait StorageBufferTrait: Send + Sync {
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
+/// Bounded buffer for metrics that are flushed to the configured backend.
 pub struct PersistentBuffer<T: TsdbStorage> {
     pub buffer: TimeSeriesBuffer<T>,
 }
@@ -95,6 +97,7 @@ impl<T: TsdbStorage> StorageBufferTrait for PersistentBuffer<T> {
     }
 }
 
+/// Bounded buffer for derived metrics that are retained only in memory.
 pub struct EphemeralBuffer<T: Metric> {
     pub buffer: TimeSeriesBuffer<T>,
 }
@@ -131,6 +134,7 @@ impl<T: Metric> StorageBufferTrait for EphemeralBuffer<T> {
     }
 }
 
+/// Owns metric buffers, flush watermarks, and the configured persistence backend.
 pub struct StorageEngine {
     buffers: HashMap<TypeId, Box<dyn StorageBufferTrait>>,
     flush_watermarks: HashMap<TypeId, i64>,
@@ -140,6 +144,7 @@ pub struct StorageEngine {
 }
 
 impl StorageEngine {
+    /// Creates storage with a periodic flush interval and backend.
     pub fn new(flush_interval_ms: i64, backend: Box<dyn StorageBackend>) -> Self {
         debug!(flush_interval_ms, "initializing metric storage engine");
         Self {
@@ -151,6 +156,7 @@ impl StorageEngine {
         }
     }
 
+    /// Registers a persistent metric buffer.
     pub fn register_buffer<T: TsdbStorage>(&mut self, capacity: usize) {
         debug!(metric_type = ?TypeId::of::<T>(), capacity, persistent = true, "registering metric buffer");
         self.buffers.insert(
@@ -163,6 +169,7 @@ impl StorageEngine {
         self.flush_watermarks.insert(TypeId::of::<T>(), 0);
     }
 
+    /// Registers an in-memory-only metric buffer.
     pub fn register_ephemeral_buffer<T: Metric>(&mut self, capacity: usize) {
         debug!(metric_type = ?TypeId::of::<T>(), capacity, persistent = false, "registering metric buffer");
         self.buffers.insert(
@@ -175,6 +182,7 @@ impl StorageEngine {
         self.flush_watermarks.insert(TypeId::of::<T>(), 0);
     }
 
+    /// Clones the requested buffers into a read-pass ledger.
     pub fn provision_ledger(
         &self,
         timestamp_ms: i64,
@@ -196,6 +204,7 @@ impl StorageEngine {
         ledger
     }
 
+    /// Commits a typed sample to its registered buffer.
     pub fn commit_sample<T: Metric>(&mut self, sample: MetricSample<T>) {
         let metric_type = TypeId::of::<T>();
         debug!(
@@ -213,14 +222,17 @@ impl StorageEngine {
         }
     }
 
+    /// Clones a complete buffer for refreshing a tick ledger.
     pub fn series_erased(&self, id: TypeId) -> Option<Box<dyn Any + Send + Sync>> {
         self.buffers.get(&id).map(|b| b.clone_to_any())
     }
 
+    /// Returns the newest sample for a type-erased metric.
     pub fn latest_erased(&self, id: TypeId) -> Option<Box<dyn Any + Send + Sync>> {
         self.buffers.get(&id).and_then(|b| b.latest_erased())
     }
 
+    /// Flushes new persistent samples when the configured interval has elapsed.
     pub fn maybe_flush(&mut self, timestamp_ms: i64) -> Result<(), String> {
         if timestamp_ms - self.last_flush_timestamp_ms < self.flush_interval_ms {
             return Ok(());

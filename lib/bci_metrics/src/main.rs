@@ -1,4 +1,4 @@
-use bci_metrics::{build_engine, FaaVolatilityMetric, RawEegMetric};
+use bci_metrics::{FaaVolatilityMetric, RawEegMetric, build_engine};
 
 fn main() -> Result<(), String> {
     let mut engine = build_engine()?;

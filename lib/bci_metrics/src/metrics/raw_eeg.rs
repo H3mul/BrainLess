@@ -1,5 +1,6 @@
 use metric_engine::{ExternalMetric, Metric, TsdbStorage};
 
+/// Four-channel raw EEG sample from the external sensor stream.
 #[derive(Clone, Debug)]
 pub struct RawEegMetric {
     pub tp9: f32,
@@ -11,6 +12,7 @@ pub struct RawEegMetric {
 impl Metric for RawEegMetric {}
 impl ExternalMetric for RawEegMetric {}
 
+/// DuckDB schema and row conversion for raw EEG samples.
 impl TsdbStorage for RawEegMetric {
     fn table_name() -> &'static str {
         "metrics_raw_eeg"

@@ -2,6 +2,7 @@ use crate::metrics::{FaaMetric, FaaVolatilityMetric};
 use metric_engine::{MetricDependency, MetricEvaluator, SampleRate, TickLedger};
 use std::collections::HashSet;
 
+/// Computes the aggregate volatility over the configured FAA history window.
 pub struct FaaVolatilityEvaluator;
 
 impl MetricEvaluator for FaaVolatilityEvaluator {

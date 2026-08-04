@@ -4,21 +4,25 @@ use std::any::TypeId;
 use std::collections::{HashMap, HashSet, VecDeque};
 use tracing::{debug, info, warn};
 
+/// Execution strategy for a compiled evaluator plan.
 pub enum ExecutionMode {
     Sequential,
     Parallel,
 }
 
+/// Topologically ordered evaluator sequence for one engine tick.
 pub struct ExecutionPlan {
     sequence: Vec<Box<dyn ErasedEvaluator>>,
     mode: ExecutionMode,
 }
 
 impl ExecutionPlan {
+    /// Creates an execution plan from an ordered evaluator sequence.
     pub fn new(sequence: Vec<Box<dyn ErasedEvaluator>>, mode: ExecutionMode) -> Self {
         Self { sequence, mode }
     }
 
+    /// Runs evaluators and refreshes produced series into the tick ledger.
     pub fn execute(
         &self,
         ledger: &mut TickLedger,
@@ -52,12 +56,14 @@ impl ExecutionPlan {
     }
 }
 
+/// Buffers and execution plan produced by DAG compilation.
 pub struct CompiledSessionResources {
     pub execution_plan: ExecutionPlan,
     pub ram_buffer_capacities: HashMap<TypeId, usize>,
     pub aggregate_demand: HashSet<MetricDependency>,
 }
 
+/// Selects required evaluators and topologically sorts their dependencies.
 pub struct DagCompiler;
 
 impl DagCompiler {
@@ -84,11 +90,8 @@ impl DagCompiler {
         }
 
         let mut selected = HashSet::new();
-
         let mut work = targets.to_vec();
-
         let mut visited = HashSet::new();
-
         while let Some(ty) = work.pop() {
             if !visited.insert(ty) {
                 continue;
@@ -136,7 +139,6 @@ impl DagCompiler {
         }
 
         let mut q = VecDeque::new();
-
         for (i, d) in degree.iter().enumerate() {
             if *d == 0 {
                 q.push_back(i)
@@ -144,13 +146,11 @@ impl DagCompiler {
         }
 
         let mut order = Vec::new();
-
         while let Some(i) = q.pop_front() {
             order.push(i);
 
             for &next in &edges[i] {
                 degree[next] -= 1;
-
                 if degree[next] == 0 {
                     q.push_back(next)
                 }
