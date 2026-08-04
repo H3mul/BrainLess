@@ -4,9 +4,16 @@ pub mod engine;
 pub mod storage;
 
 pub use core::{
-    Age, AgeRange, ErasedEvaluator, ExternalMetric, Metric, MetricDependency, MetricEvaluator,
-    MetricGroup, MetricSample, SampleRate, TickLedger, TimeSeriesBuffer,
+    Age, Metric, MetricDependency, MetricEvaluator, MetricGroup, MetricSample, ReadOnlyTickLedger,
+    SampleRate, SampleRequest, TickLedger, TimeSeriesBuffer,
 };
-pub use dag::{CompiledSessionResources, DagCompiler, ExecutionMode, ExecutionPlan};
-pub use engine::{MetricEngine, MetricEngineBuilder, TickOutputs};
-pub use storage::{DuckDbBackend, NoopStorageBackend, StorageBackend, StorageEngine, TsdbStorage};
+pub use dag::{
+    CompiledSessionResources, DagCompiler, ErasedEvaluator, ExecutionMode, ExecutionPlan,
+    ExecutionStage,
+};
+pub use engine::{
+    EvaluatorRegistration, MetricEngine, MetricEngineBuilder, MetricRegistration, boxed_evaluator,
+};
+pub use storage::{
+    DuckDbBackend, NoopStorageBackend, PersistentMetric, StorageBackend, StorageEngine,
+};

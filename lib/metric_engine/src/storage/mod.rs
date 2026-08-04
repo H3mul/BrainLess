@@ -8,13 +8,24 @@ use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, info};
 
-pub trait TsdbStorage: Metric {
+/// Application-provided persistence mapping for a metric type.
+///
+/// The engine uses this abstraction to hand formatted rows to a storage
+/// backend without knowing the database schema or SQL dialect.
+pub trait PersistentMetric: Metric {
+    /// Target table name for this metric model.
     fn table_name() -> &'static str;
+    /// Column names passed to the storage backend.
     fn schema_columns() -> &'static [&'static str];
+    /// DDL statement used to create the metric table.
     fn create_table_sql() -> &'static str;
+    /// Parameterized insert statement used for batch flushing.
     fn insert_sql() -> &'static str;
+    /// Query used to fetch a historic metric range.
     fn select_range_sql() -> &'static str;
+    /// Formats metric values into backend row parameters.
     fn to_sql_params(&self) -> Vec<String>;
+    /// Deserializes a backend row into the typed metric value.
     fn from_sql_row(row_params: &[&str]) -> Result<Self, String>;
 }
 
@@ -38,11 +49,11 @@ pub trait StorageBufferTrait: Send + Sync {
 }
 
 /// Bounded buffer for metrics that are flushed to the configured backend.
-pub struct PersistentBuffer<T: TsdbStorage> {
+pub struct PersistentBuffer<T: PersistentMetric> {
     pub buffer: TimeSeriesBuffer<T>,
 }
 
-impl<T: TsdbStorage> StorageBufferTrait for PersistentBuffer<T> {
+impl<T: PersistentMetric> StorageBufferTrait for PersistentBuffer<T> {
     fn clone_to_any(&self) -> Box<dyn Any + Send + Sync> {
         Box::new(self.buffer.clone())
     }
@@ -157,12 +168,12 @@ impl StorageEngine {
     }
 
     /// Registers a persistent metric buffer.
-    pub fn register_buffer<T: TsdbStorage>(&mut self, capacity: usize) {
-        debug!(metric_type = ?TypeId::of::<T>(), capacity, persistent = true, "registering metric buffer");
+    pub fn register_buffer<T: PersistentMetric>(&mut self, buffer_size_ms: i64) {
+        debug!(metric_type = ?TypeId::of::<T>(), buffer_size_ms, persistent = true, "registering metric buffer");
         self.buffers.insert(
             TypeId::of::<T>(),
             Box::new(PersistentBuffer {
-                buffer: TimeSeriesBuffer::<T>::with_capacity(capacity),
+                buffer: TimeSeriesBuffer::<T>::with_time_capacity_ms(buffer_size_ms),
             }),
         );
 
@@ -170,12 +181,12 @@ impl StorageEngine {
     }
 
     /// Registers an in-memory-only metric buffer.
-    pub fn register_ephemeral_buffer<T: Metric>(&mut self, capacity: usize) {
-        debug!(metric_type = ?TypeId::of::<T>(), capacity, persistent = false, "registering metric buffer");
+    pub fn register_ephemeral_buffer<T: Metric>(&mut self, buffer_size_ms: i64) {
+        debug!(metric_type = ?TypeId::of::<T>(), buffer_size_ms, persistent = false, "registering metric buffer");
         self.buffers.insert(
             TypeId::of::<T>(),
             Box::new(EphemeralBuffer {
-                buffer: TimeSeriesBuffer::<T>::with_capacity(capacity),
+                buffer: TimeSeriesBuffer::<T>::with_time_capacity_ms(buffer_size_ms),
             }),
         );
 

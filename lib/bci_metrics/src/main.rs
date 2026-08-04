@@ -3,7 +3,7 @@ use bci_metrics::{FaaVolatilityMetric, RawEegMetric, build_engine};
 fn main() -> Result<(), String> {
     let mut engine = build_engine()?;
 
-    engine.feed_external(
+    engine.feed(
         1_000,
         RawEegMetric {
             tp9: 12.0,
@@ -13,10 +13,10 @@ fn main() -> Result<(), String> {
         },
     );
 
-    let outputs = engine.tick(1_000)?;
+    let ledger = engine.tick(1_000)?;
 
-    if let Some(metric) = outputs.get_latest::<FaaVolatilityMetric>() {
-        println!("Current volatility: {}", metric.volatility);
+    if let Some(sample) = ledger.get::<FaaVolatilityMetric>()?.latest() {
+        println!("Current volatility: {}", sample.data.volatility);
     }
 
     Ok(())

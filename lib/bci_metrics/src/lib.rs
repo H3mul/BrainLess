@@ -3,20 +3,26 @@ pub mod metrics;
 
 pub use evaluators::*;
 pub use metric_engine::DuckDbBackend;
-use metric_engine::MetricEngine;
+use metric_engine::{MetricEngine, MetricRegistration, boxed_evaluator};
 pub use metrics::*;
 use std::any::TypeId;
+use std::collections::HashSet;
 
 pub fn build_engine() -> Result<MetricEngine, String> {
     MetricEngine::builder()
-        .register_persistent_metric::<RawEegMetric>(30)
-        .register_persistent_metric::<FaaMetric>(300)
-        .register_persistent_metric::<FaaVolatilityMetric>(300)
-        .register_ephemeral_metric::<TempRatioMetric>(300)
-        .register_evaluator(FaaEvaluator)
-        .register_evaluator(FaaVolatilityEvaluator)
-        .register_evaluator(TempRatioEvaluator)
-        .with_storage(DuckDbBackend::new("./sessions.duckdb"))
-        .with_targets(vec![TypeId::of::<FaaVolatilityMetric>()])
+        .with_metrics(HashSet::from([
+            MetricRegistration::ephemeral::<RawEegMetric>(),
+            MetricRegistration::ephemeral::<FaaMetric>(),
+            MetricRegistration::ephemeral::<FaaVolatilityMetric>(),
+            MetricRegistration::ephemeral::<TempRatioMetric>(),
+        ]))
+        .with_evaluators(HashSet::from([
+            boxed_evaluator(FaaEvaluator),
+            boxed_evaluator(FaaVolatilityEvaluator),
+            boxed_evaluator(TempRatioEvaluator),
+        ]))
+        .with_buffer_size(30_000)
+        .with_source_metrics(HashSet::from([TypeId::of::<RawEegMetric>()]))
+        .with_output_metrics(HashSet::from([TypeId::of::<FaaVolatilityMetric>()]))
         .build()
 }
