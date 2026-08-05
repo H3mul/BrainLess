@@ -1,4 +1,6 @@
-use crate::core::{Metric, MetricEvaluator, MetricGroup, MetricSample, TickOutputLedger};
+use crate::core::{
+    Metric, MetricDependency, MetricEvaluator, MetricGroup, MetricSample, TickOutputLedger,
+};
 use crate::dag::{CompiledSessionResources, DagCompiler, ErasedEvaluator, ExecutionMode};
 use crate::storage::{NoopStorageBackend, PersistentMetric, StorageBackend, StorageEngine};
 use std::any::TypeId;
@@ -6,7 +8,9 @@ use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use tracing::{debug, info, warn};
 
-type BufferRegistration = Box<dyn FnOnce(&mut StorageEngine, i64) + Send>;
+type BufferRegistration = Box<
+    dyn FnOnce(&mut StorageEngine, i64, &HashSet<MetricDependency>) -> Result<(), String> + Send,
+>;
 
 /// Hashable registration wrapper for a typed evaluator.
 pub struct EvaluatorRegistration {
@@ -65,8 +69,9 @@ impl MetricRegistration {
         Self {
             metric_type: TypeId::of::<T>(),
             persistence: false,
-            register: Some(Box::new(move |storage, buffer_size_ms| {
-                storage.register_ephemeral_buffer::<T>(buffer_size_ms)
+            register: Some(Box::new(move |storage, buffer_size_ms, _demand| {
+                storage.register_ephemeral_buffer::<T>(buffer_size_ms);
+                Ok(())
             })),
         }
     }
@@ -76,8 +81,8 @@ impl MetricRegistration {
         Self {
             metric_type: TypeId::of::<T>(),
             persistence: true,
-            register: Some(Box::new(move |storage, buffer_size_ms| {
-                storage.register_buffer::<T>(buffer_size_ms)
+            register: Some(Box::new(move |storage, buffer_size_ms, demand| {
+                storage.register_buffer::<T>(buffer_size_ms, demand)
             })),
         }
     }
@@ -258,7 +263,7 @@ impl MetricEngineBuilder {
         let mut storage = StorageEngine::new(flush_interval_ms, backend);
         for registration in self.registrations {
             if let Some(register) = registration.register {
-                register(&mut storage, buffer_size_ms);
+                register(&mut storage, buffer_size_ms, &resources.aggregate_demand)?;
             }
         }
         Ok(MetricEngine { storage, resources })

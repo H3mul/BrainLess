@@ -1,4 +1,4 @@
-use crate::StorageBackend;
+use crate::{SampleRate, StorageBackend};
 use tracing::{debug, info};
 
 /// DuckDB adapter boundary. A production application can replace the simple
@@ -45,16 +45,22 @@ impl StorageBackend for DuckDbBackend {
         Ok(())
     }
 
-    fn fetch_historic(&self, table: &str, window_ms: i64) -> Result<Vec<String>, String> {
+    fn fetch_historic(
+        &self,
+        table: &str,
+        window_ms: i64,
+        sample_rate: SampleRate,
+    ) -> Result<Vec<String>, String> {
         debug!(
             database = %self.database_path,
             table,
             window_ms,
+            ?sample_rate,
             "fetching historic metric rows from DuckDB backend"
         );
         println!(
-            "DuckDB {}: fetch {}ms from {}",
-            self.database_path, window_ms, table
+            "DuckDB {}: fetch {}ms from {} at {:?}",
+            self.database_path, window_ms, table, sample_rate
         );
 
         Ok(Vec::new())

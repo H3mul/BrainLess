@@ -1,13 +1,25 @@
 pub mod backend;
 pub mod duckdb_impl;
 
-use crate::core::{ErasedSeries, Metric, MetricSample, TickLedger, TimeSeriesBuffer};
+use crate::core::{
+    Age, ErasedSeries, Metric, MetricDependency, MetricSample, SampleRate, SampleRequest,
+    TickLedger, TimeSeriesBuffer,
+};
 pub use backend::{NoopStorageBackend, StorageBackend};
 pub use duckdb_impl::DuckDbBackend;
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, info};
+
+fn max_sample_rate(current: SampleRate, requested: SampleRate) -> SampleRate {
+    match (current, requested) {
+        (SampleRate::Best, _) | (_, SampleRate::Best) => SampleRate::Best,
+        (SampleRate::Hz(current), SampleRate::Hz(requested)) => {
+            SampleRate::Hz(current.max(requested))
+        }
+    }
+}
 
 /// Application-provided persistence mapping for a metric type.
 ///
@@ -28,6 +40,10 @@ pub trait PersistentMetric: Metric {
     fn to_sql_params(&self) -> Vec<String>;
     /// Deserializes a backend row into the typed metric value.
     fn from_sql_row(row_params: &[&str]) -> Result<Self, String>;
+    /// Target persistence rate for newly flushed samples. Defaults to 256 Hz.
+    fn sample_rate() -> SampleRate {
+        SampleRate::Hz(256)
+    }
 }
 
 /// Type-erased buffer operations used by `StorageEngine`.
@@ -45,10 +61,11 @@ pub(crate) trait StorageBufferTrait: Send + Sync {
     fn is_ephemeral(&self) -> bool;
 
     fn latest_erased(&self) -> Option<Box<dyn Any + Send + Sync>>;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 /// Bounded buffer for metrics that are flushed to the configured backend.
-pub struct PersistentBuffer<T: PersistentMetric> {
+pub(crate) struct PersistentBuffer<T: PersistentMetric> {
     pub buffer: Arc<TimeSeriesBuffer<T>>,
 }
 
@@ -101,10 +118,14 @@ impl<T: PersistentMetric> StorageBufferTrait for PersistentBuffer<T> {
     fn latest_erased(&self) -> Option<Box<dyn Any + Send + Sync>> {
         self.buffer.latest().cloned().map(|s| Box::new(s) as _)
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 /// Bounded buffer for derived metrics that are retained only in memory.
-pub struct EphemeralBuffer<T: Metric> {
+pub(crate) struct EphemeralBuffer<T: Metric> {
     pub buffer: Arc<TimeSeriesBuffer<T>>,
 }
 
@@ -134,6 +155,10 @@ impl<T: Metric> StorageBufferTrait for EphemeralBuffer<T> {
     fn latest_erased(&self) -> Option<Box<dyn Any + Send + Sync>> {
         self.buffer.latest().cloned().map(|s| Box::new(s) as _)
     }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 /// Owns metric buffers, flush watermarks, and the configured persistence backend.
@@ -159,16 +184,75 @@ impl StorageEngine {
     }
 
     /// Registers a persistent metric buffer.
-    pub fn register_buffer<T: PersistentMetric>(&mut self, buffer_size_ms: i64) {
-        debug!(metric_type = ?TypeId::of::<T>(), buffer_size_ms, persistent = true, "registering metric buffer");
+    pub fn register_buffer<T: PersistentMetric>(
+        &mut self,
+        buffer_size_ms: i64,
+        demand: &HashSet<MetricDependency>,
+    ) -> Result<(), String> {
+        let requested_history_ms = demand
+            .iter()
+            .filter(|dependency| dependency.type_id == TypeId::of::<T>())
+            .map(|dependency| match &dependency.request {
+                SampleRequest::Single(Age::SecondsAgo(seconds)) => *seconds as i64 * 1_000,
+                SampleRequest::Window {
+                    start: Age::SecondsAgo(seconds),
+                    ..
+                } => *seconds as i64 * 1_000,
+                _ => 0,
+            })
+            .max()
+            .unwrap_or(0);
+
+        let requested_sample_rate = demand
+            .iter()
+            .filter(|dependency| dependency.type_id == TypeId::of::<T>())
+            .filter_map(|dependency| match &dependency.request {
+                SampleRequest::Window { rate, .. } => Some(rate.clone()),
+                _ => None,
+            })
+            .fold(SampleRate::Hz(256), max_sample_rate);
+        let effective_buffer_size_ms = buffer_size_ms.max(requested_history_ms).max(1);
+
+        debug!(metric_type = ?TypeId::of::<T>(), buffer_size_ms = effective_buffer_size_ms, requested_history_ms, persistent = true, "registering metric buffer");
+
         self.buffers.insert(
             TypeId::of::<T>(),
             Box::new(PersistentBuffer {
-                buffer: Arc::new(TimeSeriesBuffer::<T>::with_time_capacity_ms(buffer_size_ms)),
+                buffer: Arc::new(TimeSeriesBuffer::<T>::with_time_capacity_ms(
+                    effective_buffer_size_ms,
+                )),
             }),
         );
 
         self.flush_watermarks.insert(TypeId::of::<T>(), 0);
+
+        if requested_history_ms > 0 {
+            let rows = self.backend.fetch_historic(
+                T::table_name(),
+                requested_history_ms,
+                requested_sample_rate.clone(),
+            )?;
+
+            if let Some(buffer) = self.buffers.get_mut(&TypeId::of::<T>()) {
+                if let Some(buffer) = buffer.as_any_mut().downcast_mut::<PersistentBuffer<T>>() {
+                    let target = Arc::make_mut(&mut buffer.buffer);
+                    for row in rows {
+                        let fields: Vec<_> = row.split(',').collect();
+                        if fields.len() < 2 {
+                            continue;
+                        }
+                        let timestamp_ms = fields[0]
+                            .parse::<i64>()
+                            .map_err(|error| error.to_string())?;
+                        target.push_sample(MetricSample {
+                            timestamp_ms,
+                            data: T::from_sql_row(&fields[1..])?,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Registers an in-memory-only metric buffer.

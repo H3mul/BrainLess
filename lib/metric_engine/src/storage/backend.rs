@@ -2,6 +2,8 @@
 ///
 /// The engine supplies table metadata and pre-formatted rows; the backend owns
 /// connections, transactions, retries, and historic data access.
+use crate::core::SampleRate;
+
 pub trait StorageBackend: Send + Sync {
     /// Writes a batch of rows to a metric table.
     fn flush_batch(
@@ -12,7 +14,12 @@ pub trait StorageBackend: Send + Sync {
     ) -> Result<(), String>;
 
     /// Fetches historic rows needed to initialize metric dependencies.
-    fn fetch_historic(&self, table_name: &str, window_ms: i64) -> Result<Vec<String>, String>;
+    fn fetch_historic(
+        &self,
+        table_name: &str,
+        window_ms: i64,
+        sample_rate: SampleRate,
+    ) -> Result<Vec<String>, String>;
 }
 
 #[derive(Default)]
@@ -24,7 +31,7 @@ impl StorageBackend for NoopStorageBackend {
         Ok(())
     }
 
-    fn fetch_historic(&self, _: &str, _: i64) -> Result<Vec<String>, String> {
+    fn fetch_historic(&self, _: &str, _: i64, _: SampleRate) -> Result<Vec<String>, String> {
         Ok(Vec::new())
     }
 }

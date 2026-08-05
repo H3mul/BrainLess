@@ -210,8 +210,6 @@ impl TickLedger {
         }
     }
 
-
-
     /// Inserts a series whose concrete type is already erased.
     pub(crate) fn insert_erased(&mut self, id: TypeId, series: Arc<dyn ErasedSeries>) {
         self.store.insert(id, series);
