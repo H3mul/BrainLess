@@ -1,5 +1,6 @@
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::Debug;
 
 /// Base trait implemented by every value that flows through the metric engine.
 /// Structs implementing this trait are expected to be both the metric type identifier
@@ -7,7 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 ///
 /// Metrics must be cloneable because the engine keeps bounded historical copies
 /// in its time-series buffers and passes read-only snapshots to evaluators.
-pub trait Metric: Send + Sync + Clone + 'static {}
+pub trait Metric: Send + Sync + Clone + Debug + 'static {}
 
 /// Sampling policy requested by a window dependency.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -145,11 +146,32 @@ impl<T: Metric> TimeSeriesBuffer<T> {
     }
 }
 
+pub(crate) trait ErasedSeries: Any + Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+    fn type_name(&self) -> &'static str;
+    fn debug_rows(&self) -> Vec<(i64, String)>;
+}
+
+impl<T: Metric> ErasedSeries for TimeSeriesBuffer<T> {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<T>()
+    }
+    fn debug_rows(&self) -> Vec<(i64, String)> {
+        self.samples
+            .iter()
+            .map(|sample| (sample.timestamp_ms, format!("{:?}", sample.data)))
+            .collect()
+    }
+}
+
 /// Read-pass snapshot shared by evaluators during one engine tick.
 #[derive(Default)]
 pub struct TickLedger {
     pub timestamp_ms: i64,
-    store: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
+    store: HashMap<TypeId, Box<dyn ErasedSeries>>,
 }
 
 /// Read-only view of a completed tick ledger exposed to engine callers.
@@ -171,6 +193,11 @@ impl ReadOnlyTickLedger {
     pub fn get<T: Metric>(&self) -> Result<&TimeSeriesBuffer<T>, String> {
         self.ledger.get::<T>()
     }
+
+    /// Pretty-prints every captured metric series with aligned timestamps.
+    pub fn pretty_print(&self) -> String {
+        self.ledger.pretty_print()
+    }
 }
 
 impl TickLedger {
@@ -188,15 +215,57 @@ impl TickLedger {
     }
 
     /// Inserts a series whose concrete type is already erased.
-    pub fn insert_erased(&mut self, id: TypeId, series: Box<dyn Any + Send + Sync>) {
+    pub(crate) fn insert_erased(&mut self, id: TypeId, series: Box<dyn ErasedSeries>) {
         self.store.insert(id, series);
     }
 
     /// Retrieves the typed series for `T`, or an explanatory missing-type error.
+    /// Pretty-prints all type-erased metric series captured in this ledger.
+    pub fn pretty_print(&self) -> String {
+        let mut series: Vec<_> = self
+            .store
+            .iter()
+            .map(|(type_id, series)| {
+                (
+                    format!("{:?} ({})", type_id, series.type_name()),
+                    series.debug_rows(),
+                )
+            })
+            .collect();
+        series.sort_by(|left, right| left.0.cmp(&right.0));
+        let timestamp_width = series
+            .iter()
+            .flat_map(|(_, rows)| {
+                rows.iter()
+                    .map(|(timestamp, _)| timestamp.to_string().len())
+            })
+            .max()
+            .unwrap_or(1);
+        let mut output = String::new();
+        for (index, (title, rows)) in series.iter().enumerate() {
+            if index > 0 {
+                output.push('\n');
+            }
+            output.push_str(title);
+            for (timestamp, value) in rows.iter() {
+                output.push_str(&format!(
+                    "\n\t{:>width$}\t{}",
+                    timestamp,
+                    value,
+                    width = timestamp_width
+                ));
+            }
+            if rows.is_empty() {
+                output.push_str("\n\t<empty>");
+            }
+        }
+        output
+    }
+
     pub fn get<T: Metric>(&self) -> Result<&TimeSeriesBuffer<T>, String> {
         self.store
             .get(&TypeId::of::<T>())
-            .and_then(|b| b.downcast_ref())
+            .and_then(|b| b.as_any().downcast_ref())
             .ok_or_else(|| format!("Metric type {:?} missing from ledger", TypeId::of::<T>()))
     }
 }

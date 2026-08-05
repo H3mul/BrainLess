@@ -1,7 +1,7 @@
 pub mod backend;
 pub mod duckdb_impl;
 
-use crate::core::{Metric, MetricSample, TickLedger, TimeSeriesBuffer};
+use crate::core::{ErasedSeries, Metric, MetricSample, TickLedger, TimeSeriesBuffer};
 pub use backend::{NoopStorageBackend, StorageBackend};
 pub use duckdb_impl::DuckDbBackend;
 use std::any::{Any, TypeId};
@@ -30,8 +30,8 @@ pub trait PersistentMetric: Metric {
 }
 
 /// Type-erased buffer operations used by `StorageEngine`.
-pub trait StorageBufferTrait: Send + Sync {
-    fn clone_to_any(&self) -> Box<dyn Any + Send + Sync>;
+pub(crate) trait StorageBufferTrait: Send + Sync {
+    fn clone_to_any(&self) -> Box<dyn ErasedSeries>;
 
     fn commit_any(&mut self, sample: Box<dyn Any + Send + Sync>);
 
@@ -44,8 +44,6 @@ pub trait StorageBufferTrait: Send + Sync {
     fn is_ephemeral(&self) -> bool;
 
     fn latest_erased(&self) -> Option<Box<dyn Any + Send + Sync>>;
-
-    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 /// Bounded buffer for metrics that are flushed to the configured backend.
@@ -54,7 +52,7 @@ pub struct PersistentBuffer<T: PersistentMetric> {
 }
 
 impl<T: PersistentMetric> StorageBufferTrait for PersistentBuffer<T> {
-    fn clone_to_any(&self) -> Box<dyn Any + Send + Sync> {
+    fn clone_to_any(&self) -> Box<dyn ErasedSeries> {
         Box::new(self.buffer.clone())
     }
 
@@ -102,10 +100,6 @@ impl<T: PersistentMetric> StorageBufferTrait for PersistentBuffer<T> {
     fn latest_erased(&self) -> Option<Box<dyn Any + Send + Sync>> {
         self.buffer.latest().cloned().map(|s| Box::new(s) as _)
     }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
 }
 
 /// Bounded buffer for derived metrics that are retained only in memory.
@@ -114,7 +108,7 @@ pub struct EphemeralBuffer<T: Metric> {
 }
 
 impl<T: Metric> StorageBufferTrait for EphemeralBuffer<T> {
-    fn clone_to_any(&self) -> Box<dyn Any + Send + Sync> {
+    fn clone_to_any(&self) -> Box<dyn ErasedSeries> {
         Box::new(self.buffer.clone())
     }
 
@@ -138,10 +132,6 @@ impl<T: Metric> StorageBufferTrait for EphemeralBuffer<T> {
 
     fn latest_erased(&self) -> Option<Box<dyn Any + Send + Sync>> {
         self.buffer.latest().cloned().map(|s| Box::new(s) as _)
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
     }
 }
 
@@ -234,7 +224,7 @@ impl StorageEngine {
     }
 
     /// Clones a complete buffer for refreshing a tick ledger.
-    pub fn series_erased(&self, id: TypeId) -> Option<Box<dyn Any + Send + Sync>> {
+    pub(crate) fn series_erased(&self, id: TypeId) -> Option<Box<dyn ErasedSeries>> {
         self.buffers.get(&id).map(|b| b.clone_to_any())
     }
 
