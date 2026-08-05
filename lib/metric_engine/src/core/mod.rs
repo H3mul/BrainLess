@@ -1,6 +1,7 @@
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
+use std::sync::Arc;
 
 /// Base trait implemented by every value that flows through the metric engine.
 /// Structs implementing this trait are expected to be both the metric type identifier
@@ -171,7 +172,7 @@ impl<T: Metric> ErasedSeries for TimeSeriesBuffer<T> {
 #[derive(Default)]
 pub struct TickLedger {
     pub timestamp_ms: i64,
-    store: HashMap<TypeId, Box<dyn ErasedSeries>>,
+    store: HashMap<TypeId, Arc<dyn ErasedSeries>>,
 }
 
 /// Read-only view of a completed tick ledger exposed to engine callers.
@@ -211,11 +212,11 @@ impl TickLedger {
 
     /// Inserts a typed series into the type-erased ledger.
     pub fn insert_series<T: Metric>(&mut self, series: TimeSeriesBuffer<T>) {
-        self.store.insert(TypeId::of::<T>(), Box::new(series));
+        self.store.insert(TypeId::of::<T>(), Arc::new(series));
     }
 
     /// Inserts a series whose concrete type is already erased.
-    pub(crate) fn insert_erased(&mut self, id: TypeId, series: Box<dyn ErasedSeries>) {
+    pub(crate) fn insert_erased(&mut self, id: TypeId, series: Arc<dyn ErasedSeries>) {
         self.store.insert(id, series);
     }
 

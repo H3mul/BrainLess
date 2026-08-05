@@ -6,6 +6,7 @@ pub use backend::{NoopStorageBackend, StorageBackend};
 pub use duckdb_impl::DuckDbBackend;
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tracing::{debug, info};
 
 /// Application-provided persistence mapping for a metric type.
@@ -31,7 +32,7 @@ pub trait PersistentMetric: Metric {
 
 /// Type-erased buffer operations used by `StorageEngine`.
 pub(crate) trait StorageBufferTrait: Send + Sync {
-    fn clone_to_any(&self) -> Box<dyn ErasedSeries>;
+    fn clone_to_any(&self) -> Arc<dyn ErasedSeries>;
 
     fn commit_any(&mut self, sample: Box<dyn Any + Send + Sync>);
 
@@ -48,17 +49,17 @@ pub(crate) trait StorageBufferTrait: Send + Sync {
 
 /// Bounded buffer for metrics that are flushed to the configured backend.
 pub struct PersistentBuffer<T: PersistentMetric> {
-    pub buffer: TimeSeriesBuffer<T>,
+    pub buffer: Arc<TimeSeriesBuffer<T>>,
 }
 
 impl<T: PersistentMetric> StorageBufferTrait for PersistentBuffer<T> {
-    fn clone_to_any(&self) -> Box<dyn ErasedSeries> {
-        Box::new(self.buffer.clone())
+    fn clone_to_any(&self) -> Arc<dyn ErasedSeries> {
+        self.buffer.clone()
     }
 
     fn commit_any(&mut self, sample: Box<dyn Any + Send + Sync>) {
         if let Ok(sample) = sample.downcast::<MetricSample<T>>() {
-            self.buffer.push_sample(*sample);
+            Arc::make_mut(&mut self.buffer).push_sample(*sample);
         }
     }
 
@@ -104,17 +105,17 @@ impl<T: PersistentMetric> StorageBufferTrait for PersistentBuffer<T> {
 
 /// Bounded buffer for derived metrics that are retained only in memory.
 pub struct EphemeralBuffer<T: Metric> {
-    pub buffer: TimeSeriesBuffer<T>,
+    pub buffer: Arc<TimeSeriesBuffer<T>>,
 }
 
 impl<T: Metric> StorageBufferTrait for EphemeralBuffer<T> {
-    fn clone_to_any(&self) -> Box<dyn ErasedSeries> {
-        Box::new(self.buffer.clone())
+    fn clone_to_any(&self) -> Arc<dyn ErasedSeries> {
+        self.buffer.clone()
     }
 
     fn commit_any(&mut self, sample: Box<dyn Any + Send + Sync>) {
         if let Ok(sample) = sample.downcast::<MetricSample<T>>() {
-            self.buffer.push_sample(*sample);
+            Arc::make_mut(&mut self.buffer).push_sample(*sample);
         }
     }
 
@@ -163,7 +164,7 @@ impl StorageEngine {
         self.buffers.insert(
             TypeId::of::<T>(),
             Box::new(PersistentBuffer {
-                buffer: TimeSeriesBuffer::<T>::with_time_capacity_ms(buffer_size_ms),
+                buffer: Arc::new(TimeSeriesBuffer::<T>::with_time_capacity_ms(buffer_size_ms)),
             }),
         );
 
@@ -176,7 +177,7 @@ impl StorageEngine {
         self.buffers.insert(
             TypeId::of::<T>(),
             Box::new(EphemeralBuffer {
-                buffer: TimeSeriesBuffer::<T>::with_time_capacity_ms(buffer_size_ms),
+                buffer: Arc::new(TimeSeriesBuffer::<T>::with_time_capacity_ms(buffer_size_ms)),
             }),
         );
 
@@ -224,7 +225,7 @@ impl StorageEngine {
     }
 
     /// Clones a complete buffer for refreshing a tick ledger.
-    pub(crate) fn series_erased(&self, id: TypeId) -> Option<Box<dyn ErasedSeries>> {
+    pub(crate) fn series_erased(&self, id: TypeId) -> Option<Arc<dyn ErasedSeries>> {
         self.buffers.get(&id).map(|b| b.clone_to_any())
     }
 
