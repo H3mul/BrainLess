@@ -67,12 +67,7 @@ pub struct ExecutionPlan {
 
 impl ExecutionPlan {
     /// Runs stages in dependency order. Evaluators within a stage are independent.
-    pub fn execute(
-        &self,
-        ledger: &mut TickLedger,
-        storage: &mut StorageEngine,
-        timestamp_ms: i64,
-    ) -> Result<(), String> {
+    pub fn execute(&self, storage: &mut StorageEngine, timestamp_ms: i64) -> Result<(), String> {
         debug!(
             stage_count = self.stages.len(),
             timestamp_ms, "executing metric evaluation plan"
@@ -91,12 +86,9 @@ impl ExecutionPlan {
                     timestamp_ms,
                     "evaluating metric"
                 );
-                evaluator.evaluate_and_commit(ledger, storage, timestamp_ms)?;
-                for type_id in evaluator.produces() {
-                    if let Some(series) = storage.series_erased(type_id) {
-                        ledger.insert_erased(type_id, series);
-                    }
-                }
+                let dependency_ledger =
+                    storage.provision_ledger(timestamp_ms, &evaluator.dependencies());
+                evaluator.evaluate_and_commit(&dependency_ledger, storage, timestamp_ms)?
             }
         }
         Ok(())

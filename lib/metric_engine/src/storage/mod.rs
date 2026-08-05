@@ -206,6 +206,15 @@ impl StorageEngine {
         ledger
     }
 
+    /// Provisions the complete storage state for external consumption after a tick.
+    pub fn provision_output_ledger(&self, timestamp_ms: i64) -> TickLedger {
+        let mut ledger = TickLedger::new(timestamp_ms);
+        for (type_id, buffer) in &self.buffers {
+            ledger.insert_erased(*type_id, buffer.clone_to_any());
+        }
+        ledger
+    }
+
     /// Commits a typed sample to its registered buffer.
     pub fn commit_sample<T: Metric>(&mut self, sample: MetricSample<T>) {
         let metric_type = TypeId::of::<T>();
@@ -225,6 +234,7 @@ impl StorageEngine {
     }
 
     /// Clones a complete buffer for refreshing a tick ledger.
+    #[allow(dead_code)]
     pub(crate) fn series_erased(&self, id: TypeId) -> Option<Arc<dyn ErasedSeries>> {
         self.buffers.get(&id).map(|b| b.clone_to_any())
     }

@@ -4,8 +4,8 @@ pub mod engine;
 pub mod storage;
 
 pub use core::{
-    Age, Metric, MetricDependency, MetricEvaluator, MetricGroup, MetricSample, ReadOnlyTickLedger,
-    SampleRate, SampleRequest, TickLedger, TimeSeriesBuffer,
+    Age, Metric, MetricDependency, MetricEvaluator, MetricGroup, MetricSample, SampleRate,
+    SampleRequest, TickLedger, TickOutputLedger, TimeSeriesBuffer,
 };
 pub use dag::{
     CompiledSessionResources, DagCompiler, ErasedEvaluator, ExecutionMode, ExecutionPlan,

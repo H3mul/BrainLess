@@ -176,11 +176,11 @@ pub struct TickLedger {
 }
 
 /// Read-only view of a completed tick ledger exposed to engine callers.
-pub struct ReadOnlyTickLedger {
+pub struct TickOutputLedger {
     ledger: TickLedger,
 }
 
-impl ReadOnlyTickLedger {
+impl TickOutputLedger {
     pub(crate) fn new(ledger: TickLedger) -> Self {
         Self { ledger }
     }
@@ -203,17 +203,14 @@ impl ReadOnlyTickLedger {
 
 impl TickLedger {
     /// Creates an empty ledger for a tick timestamp.
-    pub fn new(timestamp_ms: i64) -> Self {
+    pub(crate) fn new(timestamp_ms: i64) -> Self {
         Self {
             timestamp_ms,
             store: HashMap::new(),
         }
     }
 
-    /// Inserts a typed series into the type-erased ledger.
-    pub fn insert_series<T: Metric>(&mut self, series: TimeSeriesBuffer<T>) {
-        self.store.insert(TypeId::of::<T>(), Arc::new(series));
-    }
+
 
     /// Inserts a series whose concrete type is already erased.
     pub(crate) fn insert_erased(&mut self, id: TypeId, series: Arc<dyn ErasedSeries>) {

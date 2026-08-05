@@ -1,4 +1,4 @@
-use crate::core::{Metric, MetricEvaluator, MetricGroup, MetricSample, ReadOnlyTickLedger};
+use crate::core::{Metric, MetricEvaluator, MetricGroup, MetricSample, TickOutputLedger};
 use crate::dag::{CompiledSessionResources, DagCompiler, ErasedEvaluator, ExecutionMode};
 use crate::storage::{NoopStorageBackend, PersistentMetric, StorageBackend, StorageEngine};
 use std::any::TypeId;
@@ -294,14 +294,13 @@ impl MetricEngine {
     }
 
     /// Executes one tick and returns a read-only view of the complete ledger.
-    pub fn tick(&mut self, timestamp_ms: i64) -> Result<ReadOnlyTickLedger, String> {
-        let mut ledger = self
-            .storage
-            .provision_ledger(timestamp_ms, &self.resources.aggregate_demand);
+    pub fn tick(&mut self, timestamp_ms: i64) -> Result<TickOutputLedger, String> {
         self.resources
             .execution_plan
-            .execute(&mut ledger, &mut self.storage, timestamp_ms)?;
+            .execute(&mut self.storage, timestamp_ms)?;
         self.storage.maybe_flush(timestamp_ms)?;
-        Ok(ReadOnlyTickLedger::new(ledger))
+        Ok(TickOutputLedger::new(
+            self.storage.provision_output_ledger(timestamp_ms),
+        ))
     }
 }
