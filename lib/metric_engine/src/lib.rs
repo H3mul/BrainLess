@@ -1,6 +1,7 @@
 pub mod core;
 pub mod dag;
 pub mod engine;
+pub mod sessions;
 pub mod storage;
 
 pub use core::{
@@ -8,12 +9,13 @@ pub use core::{
     SampleRequest, TickLedger, TickOutputLedger, TimeSeriesBuffer,
 };
 pub use dag::{
-    CompiledSessionResources, DagCompiler, ErasedEvaluator, ExecutionMode, ExecutionPlan,
+    CompiledSessionResources, DagCompiler, DagGraph, ErasedEvaluator, ExecutionMode, ExecutionPlan,
     ExecutionStage,
 };
 pub use engine::{
     EvaluatorRegistration, MetricEngine, MetricEngineBuilder, MetricRegistration, boxed_evaluator,
 };
+pub use sessions::{LiveSession, LiveSessionConfig, ReplaySession, ReplaySessionConfig};
 pub use storage::{
     DuckDbBackend, NoopStorageBackend, PersistentMetric, StorageBackend, StorageEngine,
 };

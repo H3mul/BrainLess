@@ -227,30 +227,65 @@ impl StorageEngine {
         self.flush_watermarks.insert(TypeId::of::<T>(), 0);
 
         if requested_history_ms > 0 {
-            let rows = self.backend.fetch_historic(
-                T::table_name(),
-                requested_history_ms,
-                requested_sample_rate.clone(),
-            )?;
+            self.load_historic::<T>(requested_history_ms, requested_sample_rate)?;
+        }
+        Ok(())
+    }
 
-            if let Some(buffer) = self.buffers.get_mut(&TypeId::of::<T>()) {
-                if let Some(buffer) = buffer.as_any_mut().downcast_mut::<PersistentBuffer<T>>() {
-                    let target = Arc::make_mut(&mut buffer.buffer);
-                    for row in rows {
-                        let fields: Vec<_> = row.split(',').collect();
-                        if fields.len() < 2 {
-                            continue;
-                        }
-                        let timestamp_ms = fields[0]
-                            .parse::<i64>()
-                            .map_err(|error| error.to_string())?;
-                        target.push_sample(MetricSample {
-                            timestamp_ms,
-                            data: T::from_sql_row(&fields[1..])?,
-                        });
-                    }
-                }
+    /// Loads and decodes a historic range into an already registered persistent buffer.
+    pub fn load_historic_range<T: PersistentMetric>(
+        &mut self,
+        start_ms: i64,
+        end_ms: i64,
+        sample_rate: SampleRate,
+    ) -> Result<(), String> {
+        let rows =
+            self.backend
+                .fetch_historic_range(T::table_name(), start_ms, end_ms, sample_rate)?;
+        self.load_historic_rows::<T>(rows)
+    }
+
+    /// Loads and decodes the most recent historic window into a persistent buffer.
+    pub fn load_historic<T: PersistentMetric>(
+        &mut self,
+        window_ms: i64,
+        sample_rate: SampleRate,
+    ) -> Result<(), String> {
+        let rows = self
+            .backend
+            .fetch_historic(T::table_name(), window_ms, sample_rate)?;
+        self.load_historic_rows::<T>(rows)
+    }
+
+    fn load_historic_rows<T: PersistentMetric>(&mut self, rows: Vec<String>) -> Result<(), String> {
+        let buffer = self.buffers.get_mut(&TypeId::of::<T>()).ok_or_else(|| {
+            format!(
+                "Persistent buffer for {:?} is not registered",
+                TypeId::of::<T>()
+            )
+        })?;
+        let buffer = buffer
+            .as_any_mut()
+            .downcast_mut::<PersistentBuffer<T>>()
+            .ok_or_else(|| {
+                format!(
+                    "Metric {:?} is not registered as persistent",
+                    TypeId::of::<T>()
+                )
+            })?;
+        let target = Arc::make_mut(&mut buffer.buffer);
+        for row in rows {
+            let fields: Vec<_> = row.split(',').collect();
+            if fields.len() < 2 {
+                continue;
             }
+            let timestamp_ms = fields[0]
+                .parse::<i64>()
+                .map_err(|error| error.to_string())?;
+            target.push_sample(MetricSample {
+                timestamp_ms,
+                data: T::from_sql_row(&fields[1..])?,
+            });
         }
         Ok(())
     }

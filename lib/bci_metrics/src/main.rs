@@ -1,32 +1,19 @@
 use bci_metrics::{RawEegMetric, build_engine};
+use metric_engine::LiveSessionConfig;
 
 fn main() -> Result<(), String> {
-    let mut engine = build_engine()?;
-    engine.feed(
-        1_000,
-        RawEegMetric {
-            tp9: 12.0,
-            af7: 8.5,
-            af8: 5.1,
-            tp10: 9.2,
-        },
-    );
-
-    engine.tick(1_000)?;
-
-    engine.feed(
-        1_001,
-        RawEegMetric {
-            tp9: 12.0,
-            af7: 8.5,
-            af8: 5.1,
-            tp10: 5.2,
-        },
-    );
-
-    engine.tick(1_001)?;
-    let ledger = engine.tick(1_002)?;
-
+    let engine = build_engine()?;
+    let mut live = engine.live_session(
+        LiveSessionConfig::default(),
+        bci_metrics::DuckDbBackend::new("./eeg_sessions.db"),
+    )?;
+    live.push_live_metric(RawEegMetric {
+        tp9: 12.0,
+        af7: 8.5,
+        af8: 5.1,
+        tp10: 9.2,
+    });
+    let ledger = live.tick()?;
     println!("Metric ledger:\n{}", ledger.pretty_print());
     Ok(())
 }

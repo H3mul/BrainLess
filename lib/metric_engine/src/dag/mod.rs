@@ -3,6 +3,7 @@ use crate::storage::StorageEngine;
 use crate::{MetricEvaluator, MetricGroup};
 use std::any::TypeId;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 /// Object-safe evaluator interface used by the compiled execution plan.
@@ -56,7 +57,7 @@ pub enum ExecutionMode {
 
 /// A collection of evaluators with no dependencies between one another.
 pub struct ExecutionStage {
-    pub evaluators: Vec<Box<dyn ErasedEvaluator>>,
+    pub evaluators: Vec<Arc<dyn ErasedEvaluator>>,
 }
 
 /// Dependency-ordered evaluator stages for one engine tick.
@@ -104,6 +105,125 @@ pub struct CompiledSessionResources {
     pub aggregate_demand: HashSet<MetricDependency>,
 }
 
+/// Immutable evaluator dependency graph.
+///
+/// The graph can be queried repeatedly with different source and target
+/// availability sets without rebuilding evaluator relationships.
+pub struct DagGraph {
+    evaluators: Vec<Arc<dyn ErasedEvaluator>>,
+    producers: HashMap<TypeId, usize>,
+    edges: Vec<Vec<usize>>,
+}
+
+impl DagGraph {
+    /// Builds and validates the immutable evaluator graph once.
+    pub fn new(evaluators: Vec<Arc<dyn ErasedEvaluator>>) -> Result<Self, String> {
+        let mut producers = HashMap::new();
+        for (index, evaluator) in evaluators.iter().enumerate() {
+            for metric_type in evaluator.produces() {
+                if producers.insert(metric_type, index).is_some() {
+                    return Err(format!(
+                        "Multiple evaluators produce metric type {:?}",
+                        metric_type
+                    ));
+                }
+            }
+        }
+        let mut edges = vec![Vec::new(); evaluators.len()];
+        for (consumer, evaluator) in evaluators.iter().enumerate() {
+            for dependency in evaluator.dependencies() {
+                if let Some(&producer) = producers.get(&dependency.type_id) {
+                    if producer != consumer && !edges[producer].contains(&consumer) {
+                        edges[producer].push(consumer);
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            evaluators,
+            producers,
+            edges,
+        })
+    }
+
+    /// Returns a plan for the requested targets and currently available sources.
+    pub fn traversal(
+        &self,
+        targets: &HashSet<TypeId>,
+        source_metrics: &HashSet<TypeId>,
+        mode: ExecutionMode,
+    ) -> Result<CompiledSessionResources, String> {
+        let mut selected = HashSet::new();
+        let mut visited = HashSet::new();
+        let mut work: Vec<TypeId> = targets.iter().copied().collect();
+        while let Some(metric_type) = work.pop() {
+            if !visited.insert(metric_type) || source_metrics.contains(&metric_type) {
+                continue;
+            }
+            let evaluator_index = self.producers.get(&metric_type).copied().ok_or_else(|| format!("Metric type {:?} is required but has no evaluator producer and was not declared as a source", metric_type))?;
+            if selected.insert(evaluator_index) {
+                work.extend(
+                    self.evaluators[evaluator_index]
+                        .dependencies()
+                        .into_iter()
+                        .map(|dependency| dependency.type_id),
+                );
+            }
+        }
+        let selected_evaluators: Vec<_> = selected
+            .iter()
+            .map(|&index| self.evaluators[index].clone())
+            .collect();
+        let aggregate_demand = DagCompiler::calculate_resources(&selected_evaluators);
+        let stages = self.build_stages(&selected)?;
+        Ok(CompiledSessionResources {
+            execution_plan: ExecutionPlan { stages, mode },
+            aggregate_demand,
+        })
+    }
+
+    fn build_stages(&self, selected: &HashSet<usize>) -> Result<Vec<ExecutionStage>, String> {
+        let mut degree: HashMap<usize, usize> = selected.iter().map(|&index| (index, 0)).collect();
+        for &producer in selected {
+            for &consumer in &self.edges[producer] {
+                if selected.contains(&consumer) {
+                    *degree.get_mut(&consumer).unwrap() += 1;
+                }
+            }
+        }
+        let mut ready: VecDeque<_> = degree
+            .iter()
+            .filter_map(|(&index, &value)| (value == 0).then_some(index))
+            .collect();
+        let mut visited = 0;
+        let mut stages = Vec::new();
+        while !ready.is_empty() {
+            let current: Vec<_> = ready.drain(..).collect();
+            visited += current.len();
+            stages.push(ExecutionStage {
+                evaluators: current
+                    .iter()
+                    .map(|&index| self.evaluators[index].clone())
+                    .collect(),
+            });
+            for producer in current {
+                for &consumer in &self.edges[producer] {
+                    if let Some(value) = degree.get_mut(&consumer) {
+                        *value -= 1;
+                        if *value == 0 {
+                            ready.push_back(consumer);
+                        }
+                    }
+                }
+            }
+        }
+        if visited != selected.len() {
+            return Err("Cyclic dependency detected in selected evaluators graph".into());
+        }
+        Ok(stages)
+    }
+}
+
 /// Selects required evaluators, builds local dependency edges, and creates stages.
 pub struct DagCompiler;
 
@@ -116,7 +236,7 @@ impl DagCompiler {
     pub fn compile(
         targets: &HashSet<TypeId>,
         source_metrics: &HashSet<TypeId>,
-        available_evaluators: Vec<Box<dyn ErasedEvaluator>>,
+        available_evaluators: Vec<Arc<dyn ErasedEvaluator>>,
         mode: ExecutionMode,
     ) -> Result<CompiledSessionResources, String> {
         info!(
@@ -125,28 +245,18 @@ impl DagCompiler {
             evaluator_count = available_evaluators.len(),
             "compiling metric dependency graph"
         );
-        let producers = Self::index_producers(&available_evaluators)?;
-        let selected = Self::collect_required_evaluators(
-            targets,
-            source_metrics,
-            &producers,
-            available_evaluators,
-        )?;
-        let aggregate_demand = Self::calculate_resources(&selected);
-        let stages = Self::traverse_evaluator_dependencies(selected)?;
+        let graph = DagGraph::new(available_evaluators)?;
+        let resources = graph.traversal(targets, source_metrics, mode)?;
         info!(
-            stage_count = stages.len(),
-            dependency_count = aggregate_demand.len(),
+            stage_count = resources.execution_plan.stages.len(),
+            dependency_count = resources.aggregate_demand.len(),
             "metric dependency graph compiled"
         );
-        Ok(CompiledSessionResources {
-            execution_plan: ExecutionPlan { stages, mode },
-            aggregate_demand,
-        })
+        Ok(resources)
     }
 
     fn index_producers(
-        evaluators: &[Box<dyn ErasedEvaluator>],
+        evaluators: &[Arc<dyn ErasedEvaluator>],
     ) -> Result<HashMap<TypeId, usize>, String> {
         let mut producers = HashMap::new();
         for (index, evaluator) in evaluators.iter().enumerate() {
@@ -166,8 +276,8 @@ impl DagCompiler {
         targets: &HashSet<TypeId>,
         source_metrics: &HashSet<TypeId>,
         producers: &HashMap<TypeId, usize>,
-        evaluators: Vec<Box<dyn ErasedEvaluator>>,
-    ) -> Result<Vec<Box<dyn ErasedEvaluator>>, String> {
+        evaluators: Vec<Arc<dyn ErasedEvaluator>>,
+    ) -> Result<Vec<Arc<dyn ErasedEvaluator>>, String> {
         let mut selected = Vec::new();
         let mut selected_set = HashSet::new();
         let mut visited_types = HashSet::new();
@@ -202,10 +312,10 @@ impl DagCompiler {
     }
 
     fn materialize_selected(
-        mut evaluators: Vec<Box<dyn ErasedEvaluator>>,
+        mut evaluators: Vec<Arc<dyn ErasedEvaluator>>,
         indices: Vec<usize>,
-    ) -> Vec<Box<dyn ErasedEvaluator>> {
-        let mut slots: Vec<Option<Box<dyn ErasedEvaluator>>> =
+    ) -> Vec<Arc<dyn ErasedEvaluator>> {
+        let mut slots: Vec<Option<Arc<dyn ErasedEvaluator>>> =
             evaluators.drain(..).map(Some).collect();
         indices
             .into_iter()
@@ -221,7 +331,7 @@ impl DagCompiler {
     /// The same mutable in-degree state is used to form each independent stage
     /// and advance the traversal to the next dependency layer.
     fn traverse_evaluator_dependencies(
-        evaluators: Vec<Box<dyn ErasedEvaluator>>,
+        evaluators: Vec<Arc<dyn ErasedEvaluator>>,
     ) -> Result<Vec<ExecutionStage>, String> {
         // Graph nodes: Evaluators
         let mut producers = HashMap::new();
@@ -252,7 +362,7 @@ impl DagCompiler {
 
         let count = evaluators.len();
         // Copy of full evaluator list, used to track which evaluators have been executed
-        let mut slots: Vec<Option<Box<dyn ErasedEvaluator>>> =
+        let mut slots: Vec<Option<Arc<dyn ErasedEvaluator>>> =
             evaluators.into_iter().map(Some).collect();
 
         // Operational queue of evaluators that are ready to execute (degree 0)
@@ -302,7 +412,7 @@ impl DagCompiler {
     }
 
     /// Calculates buffer capacities and aggregate dependency demand from selected evaluators.
-    fn calculate_resources(evaluators: &[Box<dyn ErasedEvaluator>]) -> HashSet<MetricDependency> {
+    fn calculate_resources(evaluators: &[Arc<dyn ErasedEvaluator>]) -> HashSet<MetricDependency> {
         let mut demand: HashSet<MetricDependency> = HashSet::new();
         for evaluator in evaluators {
             for dependency in evaluator.dependencies() {

@@ -1,23 +1,26 @@
-use crate::core::{
-    Metric, MetricDependency, MetricEvaluator, MetricGroup, MetricSample, TickOutputLedger,
-};
+use crate::NoopStorageBackend;
+use crate::core::{Metric, MetricDependency, MetricEvaluator, MetricGroup, SampleRate};
 use crate::dag::{CompiledSessionResources, DagCompiler, ErasedEvaluator, ExecutionMode};
-use crate::storage::{NoopStorageBackend, PersistentMetric, StorageBackend, StorageEngine};
+use crate::sessions::{
+    LiveSession, LiveSessionConfig, ReplaySession, ReplaySessionConfig, RuntimeConfig,
+};
+use crate::storage::{PersistentMetric, StorageBackend, StorageEngine};
 use std::any::TypeId;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
-use tracing::{debug, info, warn};
+use std::sync::Arc;
+use tracing::{info, warn};
 
-type BufferRegistration = Box<
-    dyn FnOnce(&mut StorageEngine, i64, &HashSet<MetricDependency>) -> Result<(), String> + Send,
+type HistoricRegistration =
+    Arc<dyn Fn(&mut StorageEngine, i64, i64, SampleRate) -> Result<(), String> + Send + Sync>;
+type BufferRegistration = Arc<
+    dyn Fn(&mut StorageEngine, i64, &HashSet<MetricDependency>) -> Result<(), String> + Send + Sync,
 >;
 
-/// Hashable registration wrapper for a typed evaluator.
 pub struct EvaluatorRegistration {
     pub id: &'static str,
-    evaluator: Box<dyn ErasedEvaluator>,
+    pub(crate) evaluator: Arc<dyn ErasedEvaluator>,
 }
-
 impl PartialEq for EvaluatorRegistration {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
@@ -29,8 +32,6 @@ impl Hash for EvaluatorRegistration {
         self.id.hash(state);
     }
 }
-
-/// Wraps a typed evaluator for insertion into a `HashSet`.
 pub fn boxed_evaluator<E>(evaluator: E) -> EvaluatorRegistration
 where
     E: MetricEvaluator + 'static,
@@ -39,15 +40,14 @@ where
     let id = evaluator.id();
     EvaluatorRegistration {
         id,
-        evaluator: Box::new(evaluator),
+        evaluator: Arc::new(evaluator),
     }
 }
 
-/// Runtime metric registration describing persistence intent.
+#[derive(Clone)]
 pub struct MetricRegistration {
     pub metric_type: TypeId,
     pub persistence: bool,
-    register: Option<BufferRegistration>,
 }
 
 impl PartialEq for MetricRegistration {
@@ -55,6 +55,7 @@ impl PartialEq for MetricRegistration {
         self.metric_type == other.metric_type && self.persistence == other.persistence
     }
 }
+
 impl Eq for MetricRegistration {}
 impl Hash for MetricRegistration {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -64,36 +65,23 @@ impl Hash for MetricRegistration {
 }
 
 impl MetricRegistration {
-    /// Creates an ephemeral registration for any metric type.
     pub fn ephemeral<T: Metric>() -> Self {
         Self {
             metric_type: TypeId::of::<T>(),
             persistence: false,
-            register: Some(Box::new(move |storage, buffer_size_ms, _demand| {
-                storage.register_ephemeral_buffer::<T>(buffer_size_ms);
-                Ok(())
-            })),
         }
     }
-
-    /// Creates a persistent registration for a metric with a persistence mapping.
     pub fn persistent<T: PersistentMetric>() -> Self {
         Self {
             metric_type: TypeId::of::<T>(),
             persistence: true,
-            register: Some(Box::new(move |storage, buffer_size_ms, demand| {
-                storage.register_buffer::<T>(buffer_size_ms, demand)
-            })),
         }
     }
-
-    /// Creates a registration from a metric type and persistence flag.
-    pub fn new<T: Metric>(persistence: bool) -> Self {
-        if persistence {
+    pub fn new<T: Metric>(persistent: bool) -> Self {
+        if persistent {
             Self {
                 metric_type: TypeId::of::<T>(),
                 persistence: true,
-                register: None,
             }
         } else {
             Self::ephemeral::<T>()
@@ -101,15 +89,10 @@ impl MetricRegistration {
     }
 }
 
-/// Configures evaluators, buffers, targets, and persistence before compilation.
+/// Immutable declarations and the compiled evaluator graph shared by sessions.
 pub struct MetricEngineBuilder {
-    evaluators: Vec<Box<dyn ErasedEvaluator>>,
-    target_metrics: Option<HashSet<TypeId>>,
-    source_metrics: HashSet<TypeId>,
-    storage_backend: Option<Box<dyn StorageBackend>>,
-    flush_interval_ms: Option<i64>,
-    buffer_size_ms: Option<i64>,
-    registrations: Vec<MetricRegistration>,
+    evaluators: Vec<Arc<dyn ErasedEvaluator>>,
+    metrics: Vec<MetricRegistration>,
     validation_error: Option<String>,
 }
 
@@ -123,189 +106,131 @@ impl MetricEngineBuilder {
     pub fn new() -> Self {
         Self {
             evaluators: Vec::new(),
-            target_metrics: None,
-            source_metrics: HashSet::new(),
-            storage_backend: None,
-            flush_interval_ms: None,
-            buffer_size_ms: None,
-            registrations: Vec::new(),
+            metrics: Vec::new(),
             validation_error: None,
         }
     }
-
-    /// Registers and validates a batch of application evaluators for DAG compilation.
+    pub fn register_evaluator<E: MetricEvaluator + 'static>(self, evaluator: E) -> Self
+    where
+        E::Output: MetricGroup,
+    {
+        self.with_evaluators(HashSet::from([boxed_evaluator(evaluator)]))
+    }
     pub fn with_evaluators(mut self, evaluators: HashSet<EvaluatorRegistration>) -> Self {
         for registration in evaluators {
             let evaluator = registration.evaluator;
-            let evaluator_id = evaluator.id();
-            let output_types = evaluator.produces();
-            let dependency_types: HashSet<TypeId> = evaluator
-                .dependencies()
-                .into_iter()
-                .map(|dependency| dependency.type_id)
-                .collect();
-            let conflicts: HashSet<TypeId> = output_types
-                .intersection(&dependency_types)
+            let conflicts: HashSet<_> = evaluator
+                .produces()
+                .intersection(
+                    &evaluator
+                        .dependencies()
+                        .into_iter()
+                        .map(|d| d.type_id)
+                        .collect(),
+                )
                 .copied()
                 .collect();
             if !conflicts.is_empty() {
                 let error = format!(
-                    "Evaluator '{}' produces metrics that it also depends on: {:?}; evaluator outputs and dependencies must be disjoint",
-                    evaluator_id, conflicts
+                    "Evaluator '{}' outputs and dependencies intersect: {:?}",
+                    evaluator.id(),
+                    conflicts
                 );
-                warn!(
-                    evaluator = evaluator_id,
-                    ?conflicts,
-                    "invalid evaluator registration"
-                );
+                warn!(%error);
                 self.validation_error.get_or_insert(error);
             }
-            debug!(evaluator = evaluator_id, "registering metric evaluator");
             self.evaluators.push(evaluator);
         }
         self
     }
 
-    /// Registers metrics with runtime-selected persistence policies.
     pub fn with_metrics(mut self, metrics: HashSet<MetricRegistration>) -> Self {
-        if let Some(registration) = metrics
-            .iter()
-            .find(|registration| registration.persistence && registration.register.is_none())
-        {
-            let error = format!(
-                "Metric type {:?} requested persistence but has no PersistentMetric mapping",
-                registration.metric_type
-            );
-            warn!(%error, metric_type = ?registration.metric_type, "invalid metric registration");
-            self.validation_error.get_or_insert(error);
-        }
-        self.registrations.extend(metrics);
-        self
-    }
-
-    /// Sets the timestamp retention window for every metric buffer in milliseconds.
-    pub fn with_buffer_size(mut self, buffer_size_ms: i64) -> Self {
-        self.buffer_size_ms = Some(buffer_size_ms.max(1));
-        self
-    }
-
-    pub fn with_storage(mut self, backend: impl StorageBackend + 'static) -> Self {
-        self.storage_backend = Some(Box::new(backend));
-        self
-    }
-
-    /// Optionally restricts the required metric set to a subset of registered metrics.
-    pub fn with_output_metrics(mut self, targets: HashSet<TypeId>) -> Self {
-        self.target_metrics = Some(targets);
-        self
-    }
-
-    /// Declares metric types supplied externally at runtime.
-    pub fn with_source_metrics(mut self, sources: HashSet<TypeId>) -> Self {
-        self.source_metrics = sources;
-        self
-    }
-
-    /// Sets the storage flush interval in milliseconds.
-    pub fn with_storage_flush_interval(mut self, interval_ms: i64) -> Self {
-        self.flush_interval_ms = Some(interval_ms.max(1));
+        self.metrics.extend(metrics);
         self
     }
 
     pub fn build(self) -> Result<MetricEngine, String> {
-        if let Some(error) = self.validation_error.as_ref() {
-            return Err(error.clone());
+        if let Some(error) = self.validation_error {
+            return Err(error);
         }
-        if self.storage_backend.is_none()
-            && self
-                .registrations
-                .iter()
-                .any(|registration| registration.persistence)
-        {
-            let error = "Persistent metrics were registered, but no storage backend was configured; configure storage or register only ephemeral metrics";
-            warn!(%error, "invalid persistence configuration");
-            return Err(error.into());
-        }
-
-        let buffer_size_ms = self.buffer_size_ms.unwrap_or(300_000);
-        let flush_interval_ms = self.flush_interval_ms.unwrap_or_else(|| {
-            if self.buffer_size_ms.is_some() {
-                (buffer_size_ms / 2).max(1)
-            } else {
-                20_000
-            }
-        });
-        let targets = self.target_metrics.clone().unwrap_or_else(|| {
-            self.registrations
-                .iter()
-                .map(|registration| registration.metric_type)
-                .collect()
-        });
 
         info!(
             evaluator_count = self.evaluators.len(),
-            target_count = targets.len(),
-            source_count = self.source_metrics.len(),
-            buffer_registration_count = self.registrations.len(),
-            buffer_size_ms,
-            flush_interval_ms,
-            "building metric engine"
+            metric_count = self.metrics.len(),
+            "building immutable metric engine definition"
         );
-        let resources = DagCompiler::compile(
-            &targets,
-            &self.source_metrics,
-            self.evaluators,
-            ExecutionMode::Sequential,
-        )?;
-        let backend = self
-            .storage_backend
-            .unwrap_or_else(|| Box::new(NoopStorageBackend));
-        let mut storage = StorageEngine::new(flush_interval_ms, backend);
-        for registration in self.registrations {
-            if let Some(register) = registration.register {
-                register(&mut storage, buffer_size_ms, &resources.aggregate_demand)?;
-            }
-        }
-        Ok(MetricEngine { storage, resources })
+
+        Ok(MetricEngine {
+            evaluators: self.evaluators,
+            metrics: self.metrics,
+        })
     }
 }
 
-/// Orchestrates ingestion, ledger provisioning, DAG evaluation, and storage flushes.
+pub(crate) struct EngineRuntime {
+    pub(crate) storage: StorageEngine,
+    pub(crate) resources: CompiledSessionResources,
+}
+
 pub struct MetricEngine {
-    storage: StorageEngine,
-    resources: CompiledSessionResources,
+    evaluators: Vec<Arc<dyn ErasedEvaluator>>,
+    metrics: Vec<MetricRegistration>,
 }
 
 impl MetricEngine {
     pub fn builder() -> MetricEngineBuilder {
         MetricEngineBuilder::new()
     }
-
-    pub fn ingest_sample<T: Metric>(&mut self, timestamp_ms: i64, data: T) {
-        self.storage
-            .commit_sample(MetricSample { timestamp_ms, data });
+    pub(crate) fn prepare_runtime(
+        &self,
+        backend: Box<dyn StorageBackend>,
+    ) -> Result<EngineRuntime, String> {
+        let targets = config
+            .output_metrics
+            .clone()
+            .unwrap_or_else(|| self.metrics.iter().map(|m| m.metric_type).collect());
+        let resources = DagCompiler::compile(
+            &targets,
+            &config.source_metrics,
+            self.evaluators.clone(),
+            ExecutionMode::Sequential,
+        )?;
+        let mut storage = StorageEngine::new(config.flush_interval_ms, backend);
+        for metric in &self.metrics {
+            // if let Some(register) = &metric.register {
+            //     register(
+            //         &mut storage,
+            //         config.buffer_size_ms,
+            //         &resources.aggregate_demand,
+            //     )?;
+            // }
+        }
+        Ok(EngineRuntime { storage, resources })
+    }
+    pub fn live_session(
+        &self,
+        config: LiveSessionConfig,
+        backend: impl StorageBackend + 'static,
+    ) -> Result<LiveSession, String> {
+        if backend.is_noop() && self.metrics.iter().any(|metric| metric.persistence) {
+            return Err(
+                "ephemeral live sessions cannot use persistent metric registrations".into(),
+            );
+        }
+        let runtime = self.prepare_runtime(&config.runtime, Box::new(backend))?;
+        Ok(LiveSession::new(config, runtime))
     }
 
-    pub fn feed<T: Metric>(&mut self, timestamp_ms: i64, data: T) {
-        self.ingest_sample(timestamp_ms, data)
+    pub fn ephemeral_live_session(&self, config: LiveSessionConfig) -> Result<LiveSession, String> {
+        self.live_session(config, NoopStorageBackend)
     }
-
-    pub fn ingest_external_sample<T: Metric>(&mut self, timestamp_ms: i64, data: T) {
-        self.ingest_sample(timestamp_ms, data)
-    }
-
-    pub fn feed_external<T: Metric>(&mut self, timestamp_ms: i64, data: T) {
-        self.feed(timestamp_ms, data)
-    }
-
-    /// Executes one tick and returns a read-only view of the complete ledger.
-    pub fn tick(&mut self, timestamp_ms: i64) -> Result<TickOutputLedger, String> {
-        self.resources
-            .execution_plan
-            .execute(&mut self.storage, timestamp_ms)?;
-        self.storage.maybe_flush(timestamp_ms)?;
-        Ok(TickOutputLedger::new(
-            self.storage.provision_output_ledger(timestamp_ms),
-        ))
+    pub fn replay_session(
+        &self,
+        config: ReplaySessionConfig,
+        backend: impl StorageBackend + 'static,
+    ) -> Result<ReplaySession, String> {
+        let runtime_config = RuntimeConfig::default();
+        let runtime = self.prepare_runtime(&runtime_config, Box::new(backend))?;
+        Ok(ReplaySession::new(config, runtime))
     }
 }

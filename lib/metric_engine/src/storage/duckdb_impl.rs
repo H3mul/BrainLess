@@ -45,24 +45,40 @@ impl StorageBackend for DuckDbBackend {
         Ok(())
     }
 
+    fn fetch_historic_range(
+        &self,
+        table: &str,
+        start_ms: i64,
+        end_ms: i64,
+        sample_rate: SampleRate,
+    ) -> Result<Vec<String>, String> {
+        debug!(
+            database = %self.database_path,
+            table,
+            start_ms,
+            end_ms,
+            ?sample_rate,
+            "fetching historic metric rows from DuckDB backend"
+        );
+        println!(
+            "DuckDB {}: fetch {}ms..{}ms from {} at {:?}",
+            self.database_path, start_ms, end_ms, table, sample_rate
+        );
+
+        Ok(Vec::new())
+    }
+
     fn fetch_historic(
         &self,
         table: &str,
         window_ms: i64,
         sample_rate: SampleRate,
     ) -> Result<Vec<String>, String> {
-        debug!(
-            database = %self.database_path,
-            table,
-            window_ms,
-            ?sample_rate,
-            "fetching historic metric rows from DuckDB backend"
-        );
+        debug!(database = %self.database_path, table, window_ms, ?sample_rate, "fetching relative historic metric rows from DuckDB backend");
         println!(
-            "DuckDB {}: fetch {}ms from {} at {:?}",
+            "DuckDB {}: fetch last {}ms from {} at {:?}",
             self.database_path, window_ms, table, sample_rate
         );
-
         Ok(Vec::new())
     }
 }
