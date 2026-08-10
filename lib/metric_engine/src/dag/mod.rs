@@ -116,8 +116,12 @@ pub struct DagGraph {
 }
 
 impl DagGraph {
-    /// Builds and validates the immutable evaluator graph once.
+    /// Builds the local producer-consumer graph
+    ///
+    /// Graph nodes are evaluators. An edge connects a producer to a consumer
+    /// when the consumer depends on a metric produced by the producer.
     pub fn new(evaluators: Vec<Arc<dyn ErasedEvaluator>>) -> Result<Self, String> {
+        // Graph nodes: Evaluators
         let mut producers = HashMap::new();
         for (index, evaluator) in evaluators.iter().enumerate() {
             for metric_type in evaluator.produces() {
@@ -129,6 +133,8 @@ impl DagGraph {
                 }
             }
         }
+
+        // Graph edges: Evaluator produces -> Evaluator dependency
         let mut edges = vec![Vec::new(); evaluators.len()];
         for (consumer, evaluator) in evaluators.iter().enumerate() {
             for dependency in evaluator.dependencies() {
@@ -146,7 +152,11 @@ impl DagGraph {
         })
     }
 
-    /// Returns a plan for the requested targets and currently available sources.
+    /// Use the DAG to
+    ///
+    /// metrics do not create edges because they are supplied outside the DAG.
+    /// The same mutable in-degree state is used to form each independent stage
+    /// and advance the traversal to the next dependency layer.
     pub fn traversal(
         &self,
         targets: &HashSet<TypeId>,
@@ -170,11 +180,14 @@ impl DagGraph {
                 );
             }
         }
-        let selected_evaluators: Vec<_> = selected
+
+        // Collect all the dependencies of the selected evaluators
+        let aggregate_demand = selected
             .iter()
-            .map(|&index| self.evaluators[index].clone())
-            .collect();
-        let aggregate_demand = DagCompiler::calculate_resources(&selected_evaluators);
+            .map(|&index| self.evaluators[index].dependencies())
+            .flatten()
+            .collect::<HashSet<_>>();
+
         let stages = self.build_stages(&selected)?;
         Ok(CompiledSessionResources {
             execution_plan: ExecutionPlan { stages, mode },
@@ -182,6 +195,7 @@ impl DagGraph {
         })
     }
 
+    /// Traverse the graph based on the required evaluators and flush them into execution stages (sets of evaluators with no interdependency)
     fn build_stages(&self, selected: &HashSet<usize>) -> Result<Vec<ExecutionStage>, String> {
         let mut degree: HashMap<usize, usize> = selected.iter().map(|&index| (index, 0)).collect();
         for &producer in selected {
@@ -191,6 +205,10 @@ impl DagGraph {
                 }
             }
         }
+
+        // Operational queue of evaluators that are ready to execute (degree 0)
+        // Degree-zero evaluators have no local evaluator dependencies and can
+        // execute immediately. Each ready layer becomes one execution stage.
         let mut ready: VecDeque<_> = degree
             .iter()
             .filter_map(|(&index, &value)| (value == 0).then_some(index))

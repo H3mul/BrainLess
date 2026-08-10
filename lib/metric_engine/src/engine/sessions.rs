@@ -1,5 +1,6 @@
 use crate::core::{Metric, MetricSample, TickOutputLedger};
 use crate::engine::EngineRuntime;
+use crate::{DagCompiler, ExecutionMode, MetricEngine, StorageBackend, StorageEngine};
 use std::any::TypeId;
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,12 +23,45 @@ pub struct ReplaySessionConfig {
 }
 
 pub struct LiveSession {
-    pub config: LiveSessionConfig,
+    config: LiveSessionConfig,
     runtime: EngineRuntime,
 }
 impl LiveSession {
-    pub(crate) fn new(config: LiveSessionConfig, runtime: EngineRuntime) -> Self {
-        Self { config, runtime }
+    pub(crate) fn new(
+        config: LiveSessionConfig,
+        backend: Box<dyn StorageBackend>,
+        engine: &MetricEngine,
+    ) -> Self {
+        let targets = config
+            .output_metrics
+            .clone()
+            .unwrap_or_else(|| engine.metrics.iter().map(|m| m.metric_type).collect());
+
+        let resources = DagCompiler::compile(
+            &targets,
+            &config.source_metrics,
+            engine.evaluators.clone(),
+            ExecutionMode::Sequential,
+        )
+        .expect("failed to compile metric dag");
+
+        let mut storage = StorageEngine::new(config.flush_interval_ms, backend);
+
+        for metric in &engine.metrics {
+            if let Some(register) = &metric.register {
+                register(
+                    &mut storage,
+                    config.buffer_size_ms,
+                    &resources.aggregate_demand,
+                )
+                .expect("failed to register metric buffer");
+            }
+        }
+
+        Self {
+            config,
+            runtime: EngineRuntime { storage, resources },
+        }
     }
     pub fn push_live_metric<T: Metric>(&mut self, data: T) {
         let now_ms = SystemTime::now()
@@ -74,8 +108,12 @@ pub struct ReplaySession {
     runtime: EngineRuntime,
 }
 impl ReplaySession {
-    pub(crate) fn new(config: ReplaySessionConfig, runtime: EngineRuntime) -> Self {
-        Self { config, runtime }
+    pub(crate) fn new(
+        config: ReplaySessionConfig,
+        backend: Box<dyn StorageBackend>,
+        engine: &MetricEngine,
+    ) -> Self {
+        Self { config }
     }
     pub fn run(&mut self) -> Result<(), String> {
         let _ = &self.runtime;

@@ -1,9 +1,8 @@
 use crate::NoopStorageBackend;
 use crate::core::{Metric, MetricDependency, MetricEvaluator, MetricGroup, SampleRate};
 use crate::dag::{CompiledSessionResources, DagCompiler, ErasedEvaluator, ExecutionMode};
-use crate::sessions::{
-    LiveSession, LiveSessionConfig, ReplaySession, ReplaySessionConfig, RuntimeConfig,
-};
+pub mod sessions;
+use self::sessions::{LiveSession, LiveSessionConfig, ReplaySession, ReplaySessionConfig};
 use crate::storage::{PersistentMetric, StorageBackend, StorageEngine};
 use std::any::TypeId;
 use std::collections::HashSet;
@@ -46,8 +45,9 @@ where
 
 #[derive(Clone)]
 pub struct MetricRegistration {
-    pub metric_type: TypeId,
-    pub persistence: bool,
+    pub(crate) metric_type: TypeId,
+    pub(crate) persistence: bool,
+    pub(crate) register: Option<BufferRegistration>,
 }
 
 impl PartialEq for MetricRegistration {
@@ -69,12 +69,19 @@ impl MetricRegistration {
         Self {
             metric_type: TypeId::of::<T>(),
             persistence: false,
+            register: Some(Arc::new(move |storage, buffer_size_ms, _demand| {
+                storage.register_ephemeral_buffer::<T>(buffer_size_ms);
+                Ok(())
+            })),
         }
     }
     pub fn persistent<T: PersistentMetric>() -> Self {
         Self {
             metric_type: TypeId::of::<T>(),
             persistence: true,
+            register: Some(Arc::new(move |storage, buffer_size_ms, demand| {
+                storage.register_buffer::<T>(buffer_size_ms, demand)
+            })),
         }
     }
     pub fn new<T: Metric>(persistent: bool) -> Self {
@@ -82,6 +89,7 @@ impl MetricRegistration {
             Self {
                 metric_type: TypeId::of::<T>(),
                 persistence: true,
+                register: None,
             }
         } else {
             Self::ephemeral::<T>()
@@ -173,39 +181,13 @@ pub(crate) struct EngineRuntime {
 }
 
 pub struct MetricEngine {
-    evaluators: Vec<Arc<dyn ErasedEvaluator>>,
-    metrics: Vec<MetricRegistration>,
+    pub(crate) evaluators: Vec<Arc<dyn ErasedEvaluator>>,
+    pub(crate) metrics: Vec<MetricRegistration>,
 }
 
 impl MetricEngine {
     pub fn builder() -> MetricEngineBuilder {
         MetricEngineBuilder::new()
-    }
-    pub(crate) fn prepare_runtime(
-        &self,
-        backend: Box<dyn StorageBackend>,
-    ) -> Result<EngineRuntime, String> {
-        let targets = config
-            .output_metrics
-            .clone()
-            .unwrap_or_else(|| self.metrics.iter().map(|m| m.metric_type).collect());
-        let resources = DagCompiler::compile(
-            &targets,
-            &config.source_metrics,
-            self.evaluators.clone(),
-            ExecutionMode::Sequential,
-        )?;
-        let mut storage = StorageEngine::new(config.flush_interval_ms, backend);
-        for metric in &self.metrics {
-            // if let Some(register) = &metric.register {
-            //     register(
-            //         &mut storage,
-            //         config.buffer_size_ms,
-            //         &resources.aggregate_demand,
-            //     )?;
-            // }
-        }
-        Ok(EngineRuntime { storage, resources })
     }
     pub fn live_session(
         &self,
@@ -217,8 +199,7 @@ impl MetricEngine {
                 "ephemeral live sessions cannot use persistent metric registrations".into(),
             );
         }
-        let runtime = self.prepare_runtime(&config.runtime, Box::new(backend))?;
-        Ok(LiveSession::new(config, runtime))
+        Ok(LiveSession::new(config, Box::new(backend), self))
     }
 
     pub fn ephemeral_live_session(&self, config: LiveSessionConfig) -> Result<LiveSession, String> {
@@ -230,7 +211,6 @@ impl MetricEngine {
         backend: impl StorageBackend + 'static,
     ) -> Result<ReplaySession, String> {
         let runtime_config = RuntimeConfig::default();
-        let runtime = self.prepare_runtime(&runtime_config, Box::new(backend))?;
         Ok(ReplaySession::new(config, runtime))
     }
 }
