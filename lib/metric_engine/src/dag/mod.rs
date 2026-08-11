@@ -202,9 +202,7 @@ impl DagGraph {
             .flatten()
             .collect::<HashSet<_>>();
 
-        let stages = self
-            .build_stages(&required_producers)
-            .expect("Failed to produce a valid execution plan from the evaluator dependency graph");
+        let stages = self.build_stages(&required_producers)?;
 
         Ok(DagGraphTraversal {
             execution_plan: ExecutionPlan { stages, mode },
@@ -274,3 +272,6 @@ impl DagGraph {
         Ok(stages)
     }
 }
+
+#[cfg(test)]
+mod tests;
