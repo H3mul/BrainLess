@@ -1,6 +1,6 @@
 use crate::core::{Metric, MetricSample, TickOutputLedger};
-use crate::engine::EngineRuntime;
-use crate::{DagCompiler, ExecutionMode, MetricEngine, StorageBackend, StorageEngine};
+use crate::dag::DagGraphTraversal;
+use crate::{DagGraph, ExecutionMode, MetricEngine, StorageBackend, StorageEngine};
 use std::any::TypeId;
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,28 +22,34 @@ pub struct ReplaySessionConfig {
     pub write_whitelist: Vec<TypeId>,
 }
 
+#[allow(dead_code)]
 pub struct LiveSession {
     config: LiveSessionConfig,
-    runtime: EngineRuntime,
+    storage: StorageEngine,
+    dependency_traversal: DagGraphTraversal,
 }
+
 impl LiveSession {
     pub(crate) fn new(
         config: LiveSessionConfig,
         backend: Box<dyn StorageBackend>,
         engine: &MetricEngine,
     ) -> Self {
-        let targets = config
+        let graph = DagGraph::new(engine.evaluators.clone()).expect("failed to compile metric dag");
+
+        // If output_metrics is not specified, default to all metrics in the engine.
+        let output_metrics = config
             .output_metrics
             .clone()
             .unwrap_or_else(|| engine.metrics.iter().map(|m| m.metric_type).collect());
 
-        let resources = DagCompiler::compile(
-            &targets,
-            &config.source_metrics,
-            engine.evaluators.clone(),
-            ExecutionMode::Sequential,
-        )
-        .expect("failed to compile metric dag");
+        let dependency_traversal = graph
+            .traverse(
+                &config.source_metrics,
+                &output_metrics,
+                ExecutionMode::Sequential,
+            )
+            .expect("failed to traverse metric dag");
 
         let mut storage = StorageEngine::new(config.flush_interval_ms, backend);
 
@@ -52,7 +58,7 @@ impl LiveSession {
                 register(
                     &mut storage,
                     config.buffer_size_ms,
-                    &resources.aggregate_demand,
+                    &dependency_traversal.aggregate_demand,
                 )
                 .expect("failed to register metric buffer");
             }
@@ -60,7 +66,8 @@ impl LiveSession {
 
         Self {
             config,
-            runtime: EngineRuntime { storage, resources },
+            storage,
+            dependency_traversal,
         }
     }
     pub fn push_live_metric<T: Metric>(&mut self, data: T) {
@@ -71,8 +78,7 @@ impl LiveSession {
         self.push_metric(now_ms, data);
     }
     pub fn push_metric<T: Metric>(&mut self, timestamp_ms: i64, data: T) {
-        self.runtime
-            .storage
+        self.storage
             .commit_sample(MetricSample { timestamp_ms, data });
     }
     pub fn tick(&mut self) -> Result<TickOutputLedger, String> {
@@ -92,31 +98,30 @@ impl LiveSession {
         self.tick()
     }
     fn tick_at(&mut self, timestamp_ms: i64) -> Result<TickOutputLedger, String> {
-        self.runtime
-            .resources
+        self.dependency_traversal
             .execution_plan
-            .execute(&mut self.runtime.storage, timestamp_ms)?;
-        self.runtime.storage.maybe_flush(timestamp_ms)?;
+            .execute(&mut self.storage, timestamp_ms)?;
+        self.storage.maybe_flush(timestamp_ms)?;
         Ok(TickOutputLedger::new(
-            self.runtime.storage.provision_output_ledger(timestamp_ms),
+            self.storage.provision_output_ledger(timestamp_ms),
         ))
     }
 }
 
-pub struct ReplaySession {
-    pub config: ReplaySessionConfig,
-    runtime: EngineRuntime,
-}
-impl ReplaySession {
-    pub(crate) fn new(
-        config: ReplaySessionConfig,
-        backend: Box<dyn StorageBackend>,
-        engine: &MetricEngine,
-    ) -> Self {
-        Self { config }
-    }
-    pub fn run(&mut self) -> Result<(), String> {
-        let _ = &self.runtime;
-        Ok(())
-    }
-}
+// pub struct ReplaySession {
+//     pub config: ReplaySessionConfig,
+//     runtime: EngineRuntime,
+// }
+// impl ReplaySession {
+//     pub(crate) fn new(
+//         config: ReplaySessionConfig,
+//         backend: Box<dyn StorageBackend>,
+//         engine: &MetricEngine,
+//     ) -> Self {
+//         Self { config }
+//     }
+//     pub fn run(&mut self) -> Result<(), String> {
+//         let _ = &self.runtime;
+//         Ok(())
+//     }
+// }

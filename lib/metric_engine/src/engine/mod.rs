@@ -1,8 +1,8 @@
 use crate::NoopStorageBackend;
 use crate::core::{Metric, MetricDependency, MetricEvaluator, MetricGroup, SampleRate};
-use crate::dag::{CompiledSessionResources, DagCompiler, ErasedEvaluator, ExecutionMode};
+use crate::dag::ErasedEvaluator;
 pub mod sessions;
-use self::sessions::{LiveSession, LiveSessionConfig, ReplaySession, ReplaySessionConfig};
+use self::sessions::{LiveSession, LiveSessionConfig};
 use crate::storage::{PersistentMetric, StorageBackend, StorageEngine};
 use std::any::TypeId;
 use std::collections::HashSet;
@@ -10,6 +10,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tracing::{info, warn};
 
+#[allow(dead_code)]
 type HistoricRegistration =
     Arc<dyn Fn(&mut StorageEngine, i64, i64, SampleRate) -> Result<(), String> + Send + Sync>;
 type BufferRegistration = Arc<
@@ -175,11 +176,6 @@ impl MetricEngineBuilder {
     }
 }
 
-pub(crate) struct EngineRuntime {
-    pub(crate) storage: StorageEngine,
-    pub(crate) resources: CompiledSessionResources,
-}
-
 pub struct MetricEngine {
     pub(crate) evaluators: Vec<Arc<dyn ErasedEvaluator>>,
     pub(crate) metrics: Vec<MetricRegistration>,
@@ -205,12 +201,12 @@ impl MetricEngine {
     pub fn ephemeral_live_session(&self, config: LiveSessionConfig) -> Result<LiveSession, String> {
         self.live_session(config, NoopStorageBackend)
     }
-    pub fn replay_session(
-        &self,
-        config: ReplaySessionConfig,
-        backend: impl StorageBackend + 'static,
-    ) -> Result<ReplaySession, String> {
-        let runtime_config = RuntimeConfig::default();
-        Ok(ReplaySession::new(config, runtime))
-    }
+    // pub fn replay_session(
+    //     &self,
+    //     config: ReplaySessionConfig,
+    //     backend: impl StorageBackend + 'static,
+    // ) -> Result<ReplaySession, String> {
+    //     let runtime_config = RuntimeConfig::default();
+    //     Ok(ReplaySession::new(config, runtime))
+    // }
 }

@@ -7,11 +7,8 @@ pub use core::{
     Age, Metric, MetricDependency, MetricEvaluator, MetricGroup, MetricSample, SampleRate,
     SampleRequest, TickLedger, TickOutputLedger, TimeSeriesBuffer,
 };
-pub use dag::{
-    CompiledSessionResources, DagCompiler, DagGraph, ErasedEvaluator, ExecutionMode, ExecutionPlan,
-    ExecutionStage,
-};
-pub use engine::sessions::{LiveSession, LiveSessionConfig, ReplaySession, ReplaySessionConfig};
+pub use dag::{DagGraph, ErasedEvaluator, ExecutionMode, ExecutionPlan, ExecutionStage};
+pub use engine::sessions::{LiveSession, LiveSessionConfig, ReplaySessionConfig};
 pub use engine::{
     EvaluatorRegistration, MetricEngine, MetricEngineBuilder, MetricRegistration, boxed_evaluator,
 };
