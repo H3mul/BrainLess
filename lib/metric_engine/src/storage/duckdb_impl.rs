@@ -4,12 +4,12 @@ use tracing::{debug, info};
 /// DuckDB adapter boundary. A production application can replace the simple
 /// connection handle with duckdb::Connection without changing the engine.
 
-pub struct DuckDbBackend {
+pub struct DuckDbStorageBackend {
     pub database_path: String,
     pub flushed_rows: usize,
 }
 
-impl DuckDbBackend {
+impl DuckDbStorageBackend {
     pub fn new(path: impl Into<String>) -> Self {
         Self {
             database_path: path.into(),
@@ -18,7 +18,7 @@ impl DuckDbBackend {
     }
 }
 
-impl StorageBackend for DuckDbBackend {
+impl StorageBackend for DuckDbStorageBackend {
     fn flush_batch(
         &mut self,
         table: &str,

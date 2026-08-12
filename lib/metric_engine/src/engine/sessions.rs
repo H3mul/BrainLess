@@ -88,7 +88,13 @@ impl LiveSession {
             .as_millis() as i64;
         self.tick_at(now_ms)
     }
-    pub fn feed_live_batch<T: Metric>(
+
+    pub fn feed_live_metric<T: Metric>(&mut self, data: T) -> Result<TickOutputLedger, String> {
+        self.push_live_metric(data);
+        self.tick()
+    }
+
+    pub fn feed_live_metric_batch<T: Metric>(
         &mut self,
         batch: Vec<T>,
     ) -> Result<TickOutputLedger, String> {

@@ -6,7 +6,7 @@ use crate::core::{
     TickLedger, TimeSeriesBuffer,
 };
 pub use backend::{NoopStorageBackend, StorageBackend};
-pub use duckdb_impl::DuckDbBackend;
+pub use duckdb_impl::DuckDbStorageBackend;
 use std::any::{Any, TypeId};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
