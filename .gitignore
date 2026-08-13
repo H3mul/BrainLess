@@ -3,3 +3,4 @@ workspace/data/
 
 *.pyc
 *.venv
+.env

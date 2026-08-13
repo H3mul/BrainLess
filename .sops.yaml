@@ -1,0 +1,3 @@
+creation_rules:
+  - path_regex: \.env$
+    pgp: A2AF 5A4B 7474 11B2 D6B9  331C FA01 8F24 752F 2F6E
