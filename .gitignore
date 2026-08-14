@@ -1,6 +1,8 @@
 target/
 workspace/data/
 
+*.egg-info
+*__pycache__
 *.pyc
 *.venv
 .env

@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "brainless-workspace"
+version = "0.1.0"
+description = "BrainLess TimescaleDB data loading workspace"
+requires-python = ">=3.10"
+dependencies = [
+    "psycopg[binary]>=3.2.0",
+    "Jinja2>=3.1.0",
+]
+
+[project.scripts]
+push_csv_to_db = "mindmonitor_csv_db_loader:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["mindmonitor_csv_db_loader"]
+
+[tool.basedpyright]
+include = ["src"]
+pythonVersion = "3.10"
+typeCheckingMode = "recommended" 
+reportUnusedCallResult = "none"
+reportAny = "none"
+
+[tool.brainless]
+venv_path = ".venv"
+script_dependencies = [
+    "psycopg[binary]>=3.2.0",
+    "Jinja2>=3.1.0",
+]
