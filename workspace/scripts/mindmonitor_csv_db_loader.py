@@ -128,58 +128,54 @@ def load_timescaledb(
     )
     definitions.append('"Elements" TEXT')
 
-    connection_string = db_path or os.environ.get("TIMESCALEDB_URL")
+    connection_string = f"postgresql://{os.environ.get('TIMESCALE_DB_USER')}:{os.environ.get('TIMESCALE_DB_PASS')}@{os.environ.get('TIMESCALE_DB_ENDPOINT')}:5432/{os.environ.get('TIMESCALE_DB_NAME')}"
+
     if not connection_string:
         raise SystemExit(
             "TimescaleDB requires --db-path or TIMESCALEDB_URL in workspace/.env"
         )
-    try:
-        with psycopg.connect(connection_string) as connection:
-            with connection.cursor() as cursor:
-                if drop_table:
-                    cursor.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+    with psycopg.connect(connection_string) as connection:
+        with connection.cursor() as cursor:
+            if drop_table:
+                cursor.execute(f'DROP TABLE IF EXISTS "{table_name}"')
 
-                cursor.execute(
-                    f'CREATE TABLE IF NOT EXISTS "{table_name}" ({", ".join(definitions)}, '
-                    'PRIMARY KEY ("TimeStamp", "Elements"))'
-                )
-                cursor.execute(
-                    "SELECT create_hypertable(%s, %s, if_not_exists => TRUE)",
-                    (table_name, "TimeStamp"),
-                )
+            cursor.execute(
+                f'CREATE TABLE IF NOT EXISTS "{table_name}" ({", ".join(definitions)}, '
+                'PRIMARY KEY ("TimeStamp", "Elements"))'
+            )
+            cursor.execute(
+                "SELECT create_hypertable(%s, %s, if_not_exists => TRUE)",
+                (table_name, "TimeStamp"),
+            )
 
-                placeholders = ", ".join(["%s"] * len(CSV_COLUMNS))
-                columns = ", ".join(f'"{column}"' for column in CSV_COLUMNS)
-                insert_sql = (
-                    f'INSERT INTO "{table_name}" ({columns}) VALUES ({placeholders}) '
-                    'ON CONFLICT ("TimeStamp", "Elements") DO NOTHING'
-                )
+            placeholders = ", ".join(["%s"] * len(CSV_COLUMNS))
+            columns = ", ".join(f'"{column}"' for column in CSV_COLUMNS)
+            insert_sql = (
+                f'INSERT INTO "{table_name}" ({columns}) VALUES ({placeholders}) '
+                'ON CONFLICT ("TimeStamp", "Elements") DO NOTHING'
+            )
 
-                inserted = 0
-                for archive_path in sorted(glob.glob(os.path.join(csv_dir, "*.zip"))):
-                    with zipfile.ZipFile(archive_path) as archive:
-                        for member in archive.namelist():
-                            if not member.lower().endswith(".csv"):
-                                continue
-                            with archive.open(member) as source:
-                                rows = csv.DictReader(
-                                    (line.decode("utf-8-sig") for line in source)
-                                )
-                                for row in rows:
-                                    if not row.get("TimeStamp") or not row.get(
-                                        "Elements"
-                                    ):
-                                        continue
-                                    values = []
-                                    for column in CSV_COLUMNS:
-                                        value = row.get(column, "")
-                                        values.append(None if value == "" else value)
-                                    cursor.execute(insert_sql, values)
-                                    inserted += cursor.rowcount
-                connection.commit()
-                print(f"Rows inserted: {inserted}")
-    finally:
-        connection.close()
+            inserted = 0
+            for archive_path in sorted(glob.glob(os.path.join(csv_dir, "*.zip"))):
+                with zipfile.ZipFile(archive_path) as archive:
+                    for member in archive.namelist():
+                        if not member.lower().endswith(".csv"):
+                            continue
+                        with archive.open(member) as source:
+                            rows = csv.DictReader(
+                                (line.decode("utf-8-sig") for line in source)
+                            )
+                            for row in rows:
+                                if not row.get("TimeStamp") or not row.get("Elements"):
+                                    continue
+                                values = []
+                                for column in CSV_COLUMNS:
+                                    value = row.get(column, "")
+                                    values.append(None if value == "" else value)
+                                cursor.execute(insert_sql, values)
+                                inserted += cursor.rowcount
+            connection.commit()
+            print(f"Rows inserted: {inserted}")
 
 
 def main() -> None:

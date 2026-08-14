@@ -7,6 +7,8 @@ CREATE DATABASE $TIMESCALE_DB_NAME;
 -- Re-connect to the newly created database to apply user permissions locally
 \connect $TIMESCALE_DB_NAME
 
+CREATE EXTENSION IF NOT EXISTS timescaledb;
+
 -- 2. Create the Read/Write User
 CREATE USER $TIMESCALE_DB_USER WITH PASSWORD '$TIMESCALE_DB_PASS';
 
