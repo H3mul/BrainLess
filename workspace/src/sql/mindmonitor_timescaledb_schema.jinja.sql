@@ -24,5 +24,6 @@ CREATE TABLE IF NOT EXISTS "{{ table_name }}" (
 SELECT create_hypertable(
     '{{ table_name }}',
     'TimeStamp',
+    chunk_time_interval => INTERVAL '30 days',
     if_not_exists => TRUE
 );

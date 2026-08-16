@@ -3,13 +3,11 @@
 import argparse
 import csv
 import getpass
-import glob
 import io
 import logging
 import os
 import re
 import subprocess
-import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import cast
@@ -22,11 +20,6 @@ from typing_extensions import LiteralString
 TIMESCALE_SCHEMA_TEMPLATE = "mindmonitor_timescaledb_schema.jinja.sql"
 
 TIMESCALE_PROVISION_TEMPLATE = "provision_timescale_db.jinja.sql"
-COPY_COLUMN_TYPES = {
-    "TimeStamp": "timestamptz",
-    "HeadBandOn": "integer",
-    "Elements": "text",
-}
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +71,44 @@ CSV_COLUMNS = [
 ]
 
 
+def repair_row(row: list[str]) -> list[str | None]:
+    expected_cols = len(CSV_COLUMNS)
+    fixed_row = cast(list[str | None], row)
+    if len(fixed_row) < expected_cols:
+        fixed_row.extend([None] * (expected_cols - len(fixed_row)))
+
+    fixed_row = row[:expected_cols]
+
+    parsed_row = []
+    for idx, val in enumerate(fixed_row):
+        val_str = val.strip() if val else ""
+        col_name = CSV_COLUMNS[idx]
+
+        if not val_str:
+            parsed_row.append(None)
+            continue
+
+        # Convert Timestamp to native Python datetime
+        if col_name == "TimeStamp":
+            try:
+                # Adjust format if your Mind Monitor CSVs use a different date layout
+                parsed_row.append(datetime.fromisoformat(val_str))
+            except ValueError:
+                # Fallback parser if space-separated
+                parsed_row.append(datetime.strptime(val_str, "%Y-%m-%d %H:%M:%S.%f"))
+        # Convert HeadBandOn to integer
+        elif col_name == "HeadBandOn":
+            parsed_row.append(int(float(val_str)))
+        # Keep Elements as string
+        elif col_name == "Elements":
+            parsed_row.append(val_str)
+        # All numeric sensor readings to float
+        else:
+            parsed_row.append(float(val_str))
+
+    return parsed_row
+
+
 def load_sops_env(path: Path) -> None:
     logger.info("Decrypting environment file: %s", path)
     if not path.is_file():
@@ -96,13 +127,24 @@ def load_sops_env(path: Path) -> None:
     except subprocess.CalledProcessError as error:
         raise SystemExit(f"Unable to decrypt {path}: {error.stderr.strip()}") from error
 
-    for line in result.stdout.splitlines():
+    load_env_lines(result.stdout.splitlines())
+    logger.debug("SOPS environment file loaded")
+
+
+def load_env_file(path: Path) -> None:
+    logger.info("Loading environment file: %s", path)
+    if not path.is_file():
+        raise SystemExit(f"Environment file does not exist: {path}")
+    load_env_lines(path.read_text(encoding="utf-8").splitlines())
+
+
+def load_env_lines(lines: list[str]) -> None:
+    for line in lines:
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-    logger.debug("Environment file loaded")
 
 
 def parse_args() -> argparse.Namespace:
@@ -110,7 +152,9 @@ def parse_args() -> argparse.Namespace:
         description="Load Mind Monitor CSV files into TimescaleDB."
     )
     parser.add_argument(
-        "--csv-dir", default="./data/csv/", help="Directory containing CSV archives"
+        "--csv-file",
+        required=True,
+        help="CSV file to load",
     )
 
     parser.add_argument(
@@ -123,14 +167,20 @@ def parse_args() -> argparse.Namespace:
         "--drop-table", action="store_true", help="Drop the table before loading"
     )
     parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable debug logging",
+    )
+    parser.add_argument(
         "--provision",
         action="store_true",
         help="Provision the database and users before loading",
     )
     parser.add_argument(
         "--secrets-file",
-        default="sops.env",
-        help="SOPS-encrypted environment file (default: sops.env)",
+        default=None,
+        help="Optional SOPS-encrypted environment file",
     )
     parser.add_argument(
         "--superuser",
@@ -243,37 +293,49 @@ def render_sql(template_name: str, **values: object) -> LiteralString:
         "'" + str(value).replace("'", "''") + "'"
     )
     renderd_sql = environment.get_template(template_name).render(**values)
+    logger.debug("Rendered SQL: %s", renderd_sql)
     return cast(LiteralString, renderd_sql)
 
 
 def main() -> None:
+    args = parse_args()
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S%z",
     )
     logger.info("Starting Mind Monitor CSV load")
-    args = parse_args()
-    load_sops_env(Path(__file__).resolve().parents[1] / args.secrets_file)
+    workspace_dir = Path(__file__).resolve().parents[1]
+    if args.secrets_file:
+        load_sops_env(workspace_dir / args.secrets_file)
+    else:
+        env_file = workspace_dir / ".env"
+        if env_file.is_file():
+            load_env_file(env_file)
+        else:
+            logger.info("Using process environment for database settings")
 
     if args.provision:
         logger.info("Provisioning database")
         provision_timescaledb(args)
 
-    csv_dir = args.csv_dir if args.csv_dir.endswith("/") else f"{args.csv_dir}/"
-    if not os.path.isdir(csv_dir):
-        raise SystemExit(
-            f"CSV directory does not exist or is not a directory: {csv_dir}"
-        )
+    csv_file = Path(args.csv_file)
+    if not csv_file.is_file():
+        raise SystemExit(f"CSV file does not exist: {csv_file}")
 
     logger.debug("Validating application database settings")
     config = get_database_config()
-    connection_string = psycopg.conninfo.make_conninfo(
+    connection_string: str = psycopg.conninfo.make_conninfo(
         host=config["endpoint"],
         port=config["port"],
         dbname=config["database"],
         user=config["app_user"],
         password=config["app_password"],
+        sslmode="require",
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=5,
     )
 
     schema_sql = render_sql(
@@ -281,53 +343,42 @@ def main() -> None:
         table_name=args.table_name,
         drop_table=args.drop_table,
     )
-    copy_columns = sql.SQL(", ").join(sql.Identifier(column) for column in CSV_COLUMNS)
-    copy_sql = sql.SQL("COPY {} ({}) FROM STDIN (FORMAT CSV, NULL '')").format(
-        sql.Identifier(args.table_name),
-        copy_columns,
-    )
-
-    archives = sorted(glob.glob(os.path.join(csv_dir, "*.zip")))
-    logger.info("Opening database connection; found %d archive(s)", len(archives))
-    # Enable autocommit mode. This allows schema preparation and COPY streams
-    # to run without blocking Postgres system catalog locks.
-    with psycopg.connect(connection_string, autocommit=True) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SET lock_timeout = '30s'")
-
+    logger.info("Opening database connection for %s", csv_file)
+    # Keep schema setup and each file load in explicit transactions.
+    with psycopg.connect(connection_string) as conn:
+        with conn.cursor() as cur:
             if args.drop_table:
                 logger.info("Recreating db table")
             logger.info("Applying database schema")
-            cursor.execute(schema_sql)
+            cur.execute(schema_sql)
+            conn.commit()
             logger.info("Database schema ready")
 
-            logger.info("Starting text-based COPY stream")
+            logger.info("Loading CSV: %s", csv_file)
+            copy_sql = sql.SQL("COPY {} ({}) FROM STDIN").format(
+                sql.Identifier(args.table_name),
+                sql.SQL(", ").join(sql.Identifier(column) for column in CSV_COLUMNS),
+            )
 
-            # The COPY context manager MUST wrap the loop feeding data to it.
-            # Once this block exits, psycopg automatically sends the EOF signal to Postgres.
-            with cursor.copy(copy_sql) as copy:
-                for archive_path in archives:
-                    logger.info("Loading archive: %s", archive_path)
-                    with zipfile.ZipFile(archive_path) as archive:
-                        for member in archive.namelist():
-                            if not member.lower().endswith(".csv"):
-                                continue
-                            logger.info("Loading CSV: %s", member)
-                            with archive.open(member) as source:
-                                # Wrap the raw bytes to stream line-by-line efficiently
-                                text_stream = io.TextIOWrapper(
-                                    source, encoding="utf-8-sig"
-                                )
+            row_count = 0
+            with csv_file.open("rb") as source:
+                text_stream = io.TextIOWrapper(source, encoding="utf-8-sig")
+                reader = csv.reader(text_stream)
+                # next(reader, None)
 
-                                # Skip the CSV header line
-                                next(text_stream, None)
+                with cur.copy(copy_sql) as copy:
+                    for _, row in enumerate(reader, start=1):
+                        clean_row = repair_row(row)
+                        copy.write_row(clean_row)
+                        row_count += 1
+                        if row_count % 1000 == 0:
+                            logger.debug("Streamed %d rows", row_count)
 
-                                logger.info("Pushing CSV chunks for %s", member)
-                                while chunk := text_stream.read(65536):
-                                    copy.write(chunk)
-                    break  # Kept for your debugging purposes
+            conn.commit()
+            logger.info(
+                "Successfully loaded and committed %d rows from %s", row_count, csv_file
+            )
 
-        logger.info("CSV load complete")
     logger.info("CSV load complete")
 
 
