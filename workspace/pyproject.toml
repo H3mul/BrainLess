@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [project.scripts]
-push_csv_to_db = "mindmonitor_csv_db_loader:main"
+push_mindmonitor_csv_to_db = "mindmonitor_csv_db_loader:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

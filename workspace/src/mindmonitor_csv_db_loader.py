@@ -29,7 +29,7 @@ TIMESCALE_INSERT_TEMPLATE = "mindmonitor_timescaledb_insert.jinja.sql"
 TIMESCALE_PROVISION_TEMPLATE = "provision_timescale_db.jinja.sql"
 
 CSV_COLUMNS = {
-    "TimeStamp": "TIMESTAMPTZ NOT NULL",
+    "time": "TIMESTAMPTZ NOT NULL",
     "Delta_TP9": "DOUBLE PRECISION",
     "Delta_AF7": "DOUBLE PRECISION",
     "Delta_AF8": "DOUBLE PRECISION",
@@ -247,7 +247,7 @@ def insert_temp_rows(cur: psycopg.Cursor, table_name: str) -> int:
     temp_table = sql.Identifier(f"temp_{table_name}")
     target_table = sql.Identifier(table_name)
     statement = sql.SQL(
-        'INSERT INTO {} SELECT * FROM {} ON CONFLICT ("TimeStamp") DO NOTHING'
+        'INSERT INTO {} SELECT * FROM {} ON CONFLICT ("time") DO NOTHING'
     ).format(target_table, temp_table)
     cur.execute(statement)
     return max(cur.rowcount, 0)
