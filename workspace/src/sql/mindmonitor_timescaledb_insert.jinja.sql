@@ -1,13 +1,4 @@
-INSERT INTO "{{ table_name }}" (
-    "TimeStamp", "Delta_TP9", "Delta_AF7", "Delta_AF8", "Delta_TP10", "Theta_TP9", "Theta_AF7", "Theta_AF8",
-    "Theta_TP10", "Alpha_TP9", "Alpha_AF7", "Alpha_AF8", "Alpha_TP10", "Beta_TP9", "Beta_AF7", "Beta_AF8",
-    "Beta_TP10", "Gamma_TP9", "Gamma_AF7", "Gamma_AF8", "Gamma_TP10", "RAW_TP9", "RAW_AF7", "RAW_AF8", "RAW_TP10",
-    "AUX_RIGHT", "AUX_LEFT", "Accelerometer_X", "Accelerometer_Y", "Accelerometer_Z", "Gyro_X", "Gyro_Y", "Gyro_Z",
-    "PPG_Ambient", "PPG_IR", "PPG_Red", "Heart_Rate", "HeadBandOn", "HSI_TP9", "HSI_AF7", "HSI_AF8", "HSI_TP10",
-    "Battery", "Elements"
-) VALUES (
-    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-    %s, %s, %s, %s, %s, %s, %s, %s
-);
+COPY "{{ table_name }}" (
+{% for column in columns %}    "{{ column }}"{% if not loop.last %},{% endif %}
+{% endfor %}
+) FROM STDIN

@@ -8,105 +8,249 @@ import logging
 import os
 import re
 import subprocess
+import tarfile
+import zipfile
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
-from typing import cast
+from typing import BinaryIO, cast
 
 import psycopg
 from jinja2 import Environment, FileSystemLoader
 from psycopg import sql
+from psycopg.conninfo import make_conninfo
 from typing_extensions import LiteralString
 
-TIMESCALE_SCHEMA_TEMPLATE = "mindmonitor_timescaledb_schema.jinja.sql"
+CsvReader = Iterator[list[str]]
+CsvSource = tuple[str, CsvReader, int]
 
+TIMESCALE_SCHEMA_TEMPLATE = "mindmonitor_timescaledb_schema.jinja.sql"
+TIMESCALE_INSERT_TEMPLATE = "mindmonitor_timescaledb_insert.jinja.sql"
 TIMESCALE_PROVISION_TEMPLATE = "provision_timescale_db.jinja.sql"
+
+CSV_COLUMNS = {
+    "TimeStamp": "TIMESTAMPTZ NOT NULL",
+    "Delta_TP9": "DOUBLE PRECISION",
+    "Delta_AF7": "DOUBLE PRECISION",
+    "Delta_AF8": "DOUBLE PRECISION",
+    "Delta_TP10": "DOUBLE PRECISION",
+    "Theta_TP9": "DOUBLE PRECISION",
+    "Theta_AF7": "DOUBLE PRECISION",
+    "Theta_AF8": "DOUBLE PRECISION",
+    "Theta_TP10": "DOUBLE PRECISION",
+    "Alpha_TP9": "DOUBLE PRECISION",
+    "Alpha_AF7": "DOUBLE PRECISION",
+    "Alpha_AF8": "DOUBLE PRECISION",
+    "Alpha_TP10": "DOUBLE PRECISION",
+    "Beta_TP9": "DOUBLE PRECISION",
+    "Beta_AF7": "DOUBLE PRECISION",
+    "Beta_AF8": "DOUBLE PRECISION",
+    "Beta_TP10": "DOUBLE PRECISION",
+    "Gamma_TP9": "DOUBLE PRECISION",
+    "Gamma_AF7": "DOUBLE PRECISION",
+    "Gamma_AF8": "DOUBLE PRECISION",
+    "Gamma_TP10": "DOUBLE PRECISION",
+    "RAW_TP9": "DOUBLE PRECISION",
+    "RAW_AF7": "DOUBLE PRECISION",
+    "RAW_AF8": "DOUBLE PRECISION",
+    "RAW_TP10": "DOUBLE PRECISION",
+    "AUX_RIGHT": "DOUBLE PRECISION",
+    "AUX_LEFT": "DOUBLE PRECISION",
+    "Accelerometer_X": "DOUBLE PRECISION",
+    "Accelerometer_Y": "DOUBLE PRECISION",
+    "Accelerometer_Z": "DOUBLE PRECISION",
+    "Gyro_X": "DOUBLE PRECISION",
+    "Gyro_Y": "DOUBLE PRECISION",
+    "Gyro_Z": "DOUBLE PRECISION",
+    "PPG_Ambient": "DOUBLE PRECISION",
+    "PPG_IR": "DOUBLE PRECISION",
+    "PPG_Red": "DOUBLE PRECISION",
+    "Heart_Rate": "DOUBLE PRECISION",
+    "HeadBandOn": "INTEGER",
+    "HSI_TP9": "DOUBLE PRECISION",
+    "HSI_AF7": "DOUBLE PRECISION",
+    "HSI_AF8": "DOUBLE PRECISION",
+    "HSI_TP10": "DOUBLE PRECISION",
+    "Battery": "DOUBLE PRECISION",
+    "Elements": "TEXT",
+}
 
 logger = logging.getLogger(__name__)
 
-CSV_COLUMNS = [
-    "TimeStamp",
-    "Delta_TP9",
-    "Delta_AF7",
-    "Delta_AF8",
-    "Delta_TP10",
-    "Theta_TP9",
-    "Theta_AF7",
-    "Theta_AF8",
-    "Theta_TP10",
-    "Alpha_TP9",
-    "Alpha_AF7",
-    "Alpha_AF8",
-    "Alpha_TP10",
-    "Beta_TP9",
-    "Beta_AF7",
-    "Beta_AF8",
-    "Beta_TP10",
-    "Gamma_TP9",
-    "Gamma_AF7",
-    "Gamma_AF8",
-    "Gamma_TP10",
-    "RAW_TP9",
-    "RAW_AF7",
-    "RAW_AF8",
-    "RAW_TP10",
-    "AUX_RIGHT",
-    "AUX_LEFT",
-    "Accelerometer_X",
-    "Accelerometer_Y",
-    "Accelerometer_Z",
-    "Gyro_X",
-    "Gyro_Y",
-    "Gyro_Z",
-    "PPG_Ambient",
-    "PPG_IR",
-    "PPG_Red",
-    "Heart_Rate",
-    "HeadBandOn",
-    "HSI_TP9",
-    "HSI_AF7",
-    "HSI_AF8",
-    "HSI_TP10",
-    "Battery",
-    "Elements",
-]
 
-
-def repair_row(row: list[str]) -> list[str | None]:
+def repair_row(row: list[str]) -> list[object | None]:
     expected_cols = len(CSV_COLUMNS)
-    fixed_row = cast(list[str | None], row)
+    fixed_row = cast(list[str | None], row[:expected_cols])
     if len(fixed_row) < expected_cols:
         fixed_row.extend([None] * (expected_cols - len(fixed_row)))
 
-    fixed_row = row[:expected_cols]
-
-    parsed_row = []
-    for idx, val in enumerate(fixed_row):
+    parsed_row: list[object | None] = []
+    for (_, column_type), val in zip(CSV_COLUMNS.items(), fixed_row):
         val_str = val.strip() if val else ""
-        col_name = CSV_COLUMNS[idx]
 
         if not val_str:
             parsed_row.append(None)
             continue
 
-        # Convert Timestamp to native Python datetime
-        if col_name == "TimeStamp":
+        # Convert timestamp to native Python datetime.
+        if column_type.startswith("TIMESTAMPTZ"):
             try:
-                # Adjust format if your Mind Monitor CSVs use a different date layout
                 parsed_row.append(datetime.fromisoformat(val_str))
             except ValueError:
-                # Fallback parser if space-separated
                 parsed_row.append(datetime.strptime(val_str, "%Y-%m-%d %H:%M:%S.%f"))
-        # Convert HeadBandOn to integer
-        elif col_name == "HeadBandOn":
+        # Convert integer columns to integers.
+        elif column_type == "INTEGER":
             parsed_row.append(int(float(val_str)))
-        # Keep Elements as string
-        elif col_name == "Elements":
+        # Keep text columns as strings.
+        elif column_type == "TEXT":
             parsed_row.append(val_str)
         # All numeric sensor readings to float
         else:
             parsed_row.append(float(val_str))
 
     return parsed_row
+
+
+def split_paths(values: list[str]) -> list[Path]:
+    return [
+        Path(value.strip())
+        for item in values
+        for value in item.split(",")
+        if value.strip()
+    ]
+
+
+def collect_csv_files(csv_file_args: list[str], csv_dir_args: list[str]) -> list[Path]:
+    files = split_paths(csv_file_args)
+    for directory in split_paths(csv_dir_args):
+        if not directory.is_dir():
+            raise SystemExit(f"CSV directory does not exist: {directory}")
+        files.extend(
+            path
+            for path in sorted(directory.rglob("*"))
+            if path.is_file()
+            and (
+                path.name.lower().endswith(".csv")
+                or path.name.lower().endswith(".csv.tar.gz")
+                or path.name.lower().endswith(".zip")
+            )
+        )
+
+    if not files:
+        raise SystemExit("Provide --csv-file or --csv-dir")
+    for path in files:
+        if not path.is_file():
+            raise SystemExit(f"CSV source does not exist: {path}")
+    return files
+
+
+def _count_rows(stream: BinaryIO) -> int:
+    text_stream = io.TextIOWrapper(stream, encoding="utf-8-sig")
+    return max(0, sum(1 for _ in csv.reader(text_stream)) - 1)
+
+
+def _reader(stream: BinaryIO) -> CsvReader:
+    text_stream = io.TextIOWrapper(stream, encoding="utf-8-sig")
+    reader = csv.reader(text_stream)
+    # Consume csv header
+    next(reader, None)
+    return reader
+
+
+def create_csv_readers(paths: list[Path]) -> list[CsvSource]:
+    readers: list[CsvSource] = []
+    for path in paths:
+        lower_name = path.name.lower()
+        if lower_name.endswith(".zip"):
+            archive = zipfile.ZipFile(path)
+            for member in archive.infolist():
+                if member.filename.lower().endswith(".csv"):
+                    with archive.open(member) as source:
+                        total_rows = _count_rows(cast(BinaryIO, source))
+                    readers.append(
+                        (
+                            f"{path}!{member.filename}",
+                            _reader(cast(BinaryIO, archive.open(member))),
+                            total_rows,
+                        )
+                    )
+        elif lower_name.endswith(".csv.tar.gz"):
+            archive = tarfile.open(path, "r:gz")
+            for member in archive.getmembers():
+                if member.isfile() and member.name.lower().endswith(".csv"):
+                    stream = archive.extractfile(member)
+                    if stream is not None:
+                        total_rows = _count_rows(cast(BinaryIO, stream))
+                        stream = archive.extractfile(member)
+                        if stream is None:
+                            continue
+                        readers.append(
+                            (
+                                f"{path}!{member.name}",
+                                _reader(cast(BinaryIO, stream)),
+                                total_rows,
+                            )
+                        )
+        elif lower_name.endswith(".csv"):
+            with path.open("rb") as source:
+                total_rows = _count_rows(cast(BinaryIO, source))
+            readers.append(
+                (
+                    str(path),
+                    _reader(cast(BinaryIO, path.open("rb"))),
+                    total_rows,
+                )
+            )
+        else:
+            raise SystemExit(f"Unsupported CSV source: {path}")
+    if not readers:
+        raise SystemExit("No CSV files found in the provided sources")
+    return readers
+
+
+def load_csv_readers(
+    cur: psycopg.Cursor,
+    table_name: str,
+    readers: list[CsvSource],
+) -> int:
+    temp_table_name = f"temp_{table_name}"
+    copy_sql = render_sql(
+        TIMESCALE_INSERT_TEMPLATE,
+        table_name=temp_table_name,
+        columns=CSV_COLUMNS,
+    )
+    total_rows = sum(total for _, _, total in readers)
+    ingested_rows = 0
+    for source_name, reader, source_total in readers:
+        logger.debug("Loading CSV: %s", source_name)
+        row_count = 0
+        with cur.copy(copy_sql) as copy:
+            for row in reader:
+                copy.write_row(repair_row(row))
+                row_count += 1
+                if row_count % 10000 == 0:
+                    logger.debug(
+                        "Streamed %d rows to COPY from %s", row_count, source_name
+                    )
+        ingested_rows += row_count
+        progress = ingested_rows / total_rows * 100 if total_rows else 100.0
+        logger.info(
+            "(%.1f%%) Added %d rows from %s",
+            progress,
+            row_count,
+            source_name,
+        )
+    return ingested_rows
+
+
+def insert_temp_rows(cur: psycopg.Cursor, table_name: str) -> int:
+    temp_table = sql.Identifier(f"temp_{table_name}")
+    target_table = sql.Identifier(table_name)
+    statement = sql.SQL(
+        'INSERT INTO {} SELECT * FROM {} ON CONFLICT ("TimeStamp") DO NOTHING'
+    ).format(target_table, temp_table)
+    cur.execute(statement)
+    return max(cur.rowcount, 0)
 
 
 def load_sops_env(path: Path) -> None:
@@ -153,8 +297,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--csv-file",
-        required=True,
-        help="CSV file to load",
+        action="append",
+        default=[],
+        help="CSV file(s), comma-separated or repeated",
+    )
+    parser.add_argument(
+        "--csv-dir",
+        action="append",
+        default=[],
+        help="Directory containing CSV sources, comma-separated or repeated",
     )
 
     parser.add_argument(
@@ -242,8 +393,6 @@ def provision_timescaledb(args: argparse.Namespace) -> None:
 
     database_sql = render_sql(
         TIMESCALE_PROVISION_TEMPLATE,
-        include_database=True,
-        include_users=False,
         provision_read_user=provision_read_user,
         database=database,
         app_user=app_user,
@@ -261,7 +410,7 @@ def provision_timescaledb(args: argparse.Namespace) -> None:
     }
 
     logger.debug("Creating database if needed")
-    admin_conninfo = psycopg.conninfo.make_conninfo(**admin_info)
+    admin_conninfo = make_conninfo(**admin_info)
     with psycopg.connect(admin_conninfo, autocommit=True) as connection:
         with connection.cursor() as cursor:
             try:
@@ -273,10 +422,10 @@ def provision_timescaledb(args: argparse.Namespace) -> None:
             except psycopg.errors.DuplicateDatabase:
                 logger.info("Database already exists")
 
-    logger.debug("Reconnecting to database and provisioning")
+    logger.info(f"Provisioning users and privileges")
     # Reconnect to connect to the database
     database_info = {**admin_info, "dbname": cast(str, database)}
-    database_conninfo = psycopg.conninfo.make_conninfo(**database_info)
+    database_conninfo = make_conninfo(**database_info)
     with psycopg.connect(database_conninfo, autocommit=True) as connection:
         with connection.cursor() as cursor:
             cursor.execute(database_sql)
@@ -318,14 +467,15 @@ def main() -> None:
     if args.provision:
         logger.info("Provisioning database")
         provision_timescaledb(args)
+        if not args.csv_file and not args.csv_dir:
+            logger.info("Provisioning complete; no CSV sources provided")
+            return
 
-    csv_file = Path(args.csv_file)
-    if not csv_file.is_file():
-        raise SystemExit(f"CSV file does not exist: {csv_file}")
+    csv_paths = collect_csv_files(args.csv_file, args.csv_dir)
 
     logger.debug("Validating application database settings")
     config = get_database_config()
-    connection_string: str = psycopg.conninfo.make_conninfo(
+    connection_string = make_conninfo(
         host=config["endpoint"],
         port=config["port"],
         dbname=config["database"],
@@ -341,43 +491,39 @@ def main() -> None:
     schema_sql = render_sql(
         TIMESCALE_SCHEMA_TEMPLATE,
         table_name=args.table_name,
+        columns=CSV_COLUMNS,
         drop_table=args.drop_table,
     )
-    logger.info("Opening database connection for %s", csv_file)
+    logger.info("Opening database connection for %d CSV source(s)", len(csv_paths))
     # Keep schema setup and each file load in explicit transactions.
     with psycopg.connect(connection_string) as conn:
-        with conn.cursor() as cur:
-            if args.drop_table:
-                logger.info("Recreating db table")
-            logger.info("Applying database schema")
-            cur.execute(schema_sql)
-            conn.commit()
-            logger.info("Database schema ready")
+        readers = create_csv_readers(csv_paths)
+        with conn.transaction():
+            with conn.cursor() as cur:
+                if args.drop_table:
+                    logger.info("Recreating db table")
+                logger.info("Applying database schema")
+                cur.execute(schema_sql)
 
-            logger.info("Loading CSV: %s", csv_file)
-            copy_sql = sql.SQL("COPY {} ({}) FROM STDIN").format(
-                sql.Identifier(args.table_name),
-                sql.SQL(", ").join(sql.Identifier(column) for column in CSV_COLUMNS),
-            )
-
-            row_count = 0
-            with csv_file.open("rb") as source:
-                text_stream = io.TextIOWrapper(source, encoding="utf-8-sig")
-                reader = csv.reader(text_stream)
-                # next(reader, None)
-
-                with cur.copy(copy_sql) as copy:
-                    for _, row in enumerate(reader, start=1):
-                        clean_row = repair_row(row)
-                        copy.write_row(clean_row)
-                        row_count += 1
-                        if row_count % 1000 == 0:
-                            logger.debug("Streamed %d rows", row_count)
-
-            conn.commit()
-            logger.info(
-                "Successfully loaded and committed %d rows from %s", row_count, csv_file
-            )
+                temp_table_sql = sql.SQL(
+                    "CREATE TEMP TABLE {} (LIKE {} INCLUDING DEFAULTS) ON COMMIT DROP"
+                ).format(
+                    sql.Identifier(f"temp_{args.table_name}"),
+                    sql.Identifier(args.table_name),
+                )
+                logger.info("Creating temp table")
+                cur.execute(temp_table_sql)
+                ingested_rows = load_csv_readers(cur, args.table_name, readers)
+                logger.info(
+                    "Loaded %d rows from CSV into temp table, inserting into main table",
+                    ingested_rows,
+                )
+                inserted_rows = insert_temp_rows(cur, args.table_name)
+                logger.info(
+                    "Final insert: %d deduplicated rows inserted from %d ingested rows",
+                    inserted_rows,
+                    ingested_rows,
+                )
 
     logger.info("CSV load complete")
 

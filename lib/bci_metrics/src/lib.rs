@@ -1,10 +1,12 @@
 pub mod evaluators;
+pub mod ingest;
 pub mod metrics;
 
 pub use evaluators::*;
 pub use metric_engine::DuckDbStorageBackend;
 use metric_engine::{MetricEngine, MetricRegistration, boxed_evaluator};
 pub use metrics::*;
+
 use std::collections::HashSet;
 
 pub fn build_eeg_engine() -> Result<MetricEngine, String> {
