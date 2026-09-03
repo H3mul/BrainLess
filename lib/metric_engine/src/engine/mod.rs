@@ -1,21 +1,20 @@
 use crate::NoopStorageBackend;
-use crate::core::{Metric, MetricDependency, MetricEvaluator, MetricGroup, SampleRate};
+use crate::core::{Metric, MetricDependency, MetricEvaluator, MetricGroup};
 use crate::dag::ErasedEvaluator;
 pub mod sessions;
 use self::sessions::{LiveSession, LiveSessionConfig};
-use crate::storage::{PersistentMetric, StorageBackend, StorageEngine};
+use crate::storage::{BufferStore, PersistentMetric, StorageBackend};
 use std::any::TypeId;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tracing::{info, warn};
 
-#[allow(dead_code)]
-type HistoricRegistration =
-    Arc<dyn Fn(&mut StorageEngine, i64, i64, SampleRate) -> Result<(), String> + Send + Sync>;
-type BufferRegistration = Arc<
-    dyn Fn(&mut StorageEngine, i64, &HashSet<MetricDependency>) -> Result<(), String> + Send + Sync,
->;
+/// Erased buffer registration for a metric type. A plain function pointer: the
+/// constructors never capture state, so every registration is guaranteed to have
+/// one and no metric can silently lack a buffer.
+type BufferRegistration =
+    fn(&mut BufferStore, i64, &HashSet<MetricDependency>) -> Result<(), String>;
 
 pub struct EvaluatorRegistration {
     pub id: &'static str,
@@ -44,11 +43,11 @@ where
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct MetricRegistration {
     pub(crate) metric_type: TypeId,
     pub(crate) persistence: bool,
-    pub(crate) register: Option<BufferRegistration>,
+    pub(crate) register: BufferRegistration,
 }
 
 impl PartialEq for MetricRegistration {
@@ -70,30 +69,17 @@ impl MetricRegistration {
         Self {
             metric_type: TypeId::of::<T>(),
             persistence: false,
-            register: Some(Arc::new(move |storage, buffer_size_ms, _demand| {
+            register: |storage, buffer_size_ms, _demand| {
                 storage.register_ephemeral_buffer::<T>(buffer_size_ms);
                 Ok(())
-            })),
+            },
         }
     }
     pub fn persistent<T: PersistentMetric>() -> Self {
         Self {
             metric_type: TypeId::of::<T>(),
             persistence: true,
-            register: Some(Arc::new(move |storage, buffer_size_ms, demand| {
-                storage.register_buffer::<T>(buffer_size_ms, demand)
-            })),
-        }
-    }
-    pub fn new<T: Metric>(persistent: bool) -> Self {
-        if persistent {
-            Self {
-                metric_type: TypeId::of::<T>(),
-                persistence: true,
-                register: None,
-            }
-        } else {
-            Self::ephemeral::<T>()
+            register: BufferStore::register_buffer::<T>,
         }
     }
 }
@@ -176,9 +162,10 @@ impl MetricEngineBuilder {
     }
 }
 
+/// Collection of Evaluator and Metric implementations for the metric engine.
 pub struct MetricEngine {
-    pub(crate) evaluators: Vec<Arc<dyn ErasedEvaluator>>,
-    pub(crate) metrics: Vec<MetricRegistration>,
+    pub evaluators: Vec<Arc<dyn ErasedEvaluator>>,
+    pub metrics: Vec<MetricRegistration>,
 }
 
 impl MetricEngine {

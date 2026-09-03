@@ -13,5 +13,5 @@ pub use engine::{
     EvaluatorRegistration, MetricEngine, MetricEngineBuilder, MetricRegistration, boxed_evaluator,
 };
 pub use storage::{
-    DuckDbStorageBackend, NoopStorageBackend, PersistentMetric, StorageBackend, StorageEngine,
+    BufferStore, DuckDbStorageBackend, NoopStorageBackend, PersistentMetric, StorageBackend,
 };

@@ -1,16 +1,24 @@
 use crate::core::{Metric, MetricSample, TickOutputLedger};
 use crate::dag::DagGraphTraversal;
-use crate::{DagGraph, ExecutionMode, MetricEngine, StorageBackend, StorageEngine};
+use crate::{BufferStore, DagGraph, ExecutionMode, MetricEngine, StorageBackend};
 use std::any::TypeId;
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Live-only configuration. Storage is supplied separately when creating the session.
+/// Live-only configuration:
+///   - metrics are fed externally, execution ticks are externally triggered
+///   - data is retained in memory for calculation purposes and live feedback,
+///     with periodic flushing to persistent storage
 #[derive(Default)]
 pub struct LiveSessionConfig {
+    /// Total in-memory buffer size for all metrics, in milliseconds.
     pub buffer_size_ms: i64,
+    /// Interval at which to flush buffers to storage, in milliseconds.
     pub flush_interval_ms: i64,
+    /// Set of source metrics the session expects to receive externally.
     pub source_metrics: HashSet<TypeId>,
+    /// Set of output metrics the session is expected to produce
+    /// (Optional, if absent defaults to entire metric set)
     pub output_metrics: Option<HashSet<TypeId>>,
 }
 
@@ -25,7 +33,7 @@ pub struct ReplaySessionConfig {
 #[allow(dead_code)]
 pub struct LiveSession {
     config: LiveSessionConfig,
-    storage: StorageEngine,
+    storage: BufferStore,
     dependency_traversal: DagGraphTraversal,
 }
 
@@ -51,17 +59,15 @@ impl LiveSession {
             )
             .expect("failed to traverse metric dag");
 
-        let mut storage = StorageEngine::new(config.flush_interval_ms, backend);
+        let mut storage = BufferStore::new(config.flush_interval_ms, backend);
 
         for metric in &engine.metrics {
-            if let Some(register) = &metric.register {
-                register(
-                    &mut storage,
-                    config.buffer_size_ms,
-                    &dependency_traversal.aggregate_demand,
-                )
-                .expect("failed to register metric buffer");
-            }
+            (metric.register)(
+                &mut storage,
+                config.buffer_size_ms,
+                &dependency_traversal.aggregate_demand,
+            )
+            .expect("failed to register metric buffer");
         }
 
         Self {

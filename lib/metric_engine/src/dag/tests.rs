@@ -41,7 +41,7 @@ impl ErasedEvaluator for MockEvaluator {
     fn evaluate_and_commit(
         &self,
         _ledger: &TickLedger,
-        _storage: &mut StorageEngine,
+        _storage: &mut BufferStore,
         _timestamp_ms: i64,
     ) -> Result<(), String> {
         Ok(())

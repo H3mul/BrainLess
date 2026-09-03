@@ -275,7 +275,7 @@ pub trait MetricGroup: Send + Sync + 'static {
     fn type_ids() -> HashSet<TypeId>;
 
     /// Commits the output values to the engine's storage buffers.
-    fn commit_to_storage(self, storage: &mut crate::storage::StorageEngine, timestamp_ms: i64);
+    fn commit_to_storage(self, storage: &mut crate::storage::BufferStore, timestamp_ms: i64);
 }
 
 impl<T: Metric> MetricGroup for T {
@@ -283,7 +283,7 @@ impl<T: Metric> MetricGroup for T {
         HashSet::from([TypeId::of::<T>()])
     }
 
-    fn commit_to_storage(self, storage: &mut crate::storage::StorageEngine, timestamp_ms: i64) {
+    fn commit_to_storage(self, storage: &mut crate::storage::BufferStore, timestamp_ms: i64) {
         storage.commit_sample(MetricSample {
             timestamp_ms,
             data: self,
@@ -296,7 +296,7 @@ impl<A: Metric, B: Metric> MetricGroup for (A, B) {
         HashSet::from([TypeId::of::<A>(), TypeId::of::<B>()])
     }
 
-    fn commit_to_storage(self, storage: &mut crate::storage::StorageEngine, timestamp_ms: i64) {
+    fn commit_to_storage(self, storage: &mut crate::storage::BufferStore, timestamp_ms: i64) {
         storage.commit_sample(MetricSample {
             timestamp_ms,
             data: self.0,

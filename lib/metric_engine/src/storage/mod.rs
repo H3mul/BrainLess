@@ -162,7 +162,7 @@ impl<T: Metric> StorageBufferTrait for EphemeralBuffer<T> {
 }
 
 /// Owns metric buffers, flush watermarks, and the configured persistence backend.
-pub struct StorageEngine {
+pub struct BufferStore {
     buffers: HashMap<TypeId, Box<dyn StorageBufferTrait>>,
     flush_watermarks: HashMap<TypeId, i64>,
     last_flush_timestamp_ms: i64,
@@ -170,7 +170,7 @@ pub struct StorageEngine {
     backend: Box<dyn StorageBackend>,
 }
 
-impl StorageEngine {
+impl BufferStore {
     /// Creates storage with a periodic flush interval and backend.
     pub fn new(flush_interval_ms: i64, backend: Box<dyn StorageBackend>) -> Self {
         debug!(flush_interval_ms, "initializing metric storage engine");

@@ -1,5 +1,4 @@
 pub mod evaluators;
-pub mod ingest;
 pub mod metrics;
 
 pub use evaluators::*;

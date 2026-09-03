@@ -1,5 +1,5 @@
 use crate::core::{MetricDependency, TickLedger};
-use crate::storage::StorageEngine;
+use crate::storage::BufferStore;
 use crate::{MetricEvaluator, MetricGroup};
 use std::any::TypeId;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -18,7 +18,7 @@ pub trait ErasedEvaluator: Send + Sync {
     fn evaluate_and_commit(
         &self,
         ledger: &TickLedger,
-        storage: &mut StorageEngine,
+        storage: &mut BufferStore,
         timestamp_ms: i64,
     ) -> Result<(), String>;
 }
@@ -40,7 +40,7 @@ where
     fn evaluate_and_commit(
         &self,
         ledger: &TickLedger,
-        storage: &mut StorageEngine,
+        storage: &mut BufferStore,
         timestamp_ms: i64,
     ) -> Result<(), String> {
         self.evaluate(ledger)?
@@ -68,7 +68,7 @@ pub struct ExecutionPlan {
 
 impl ExecutionPlan {
     /// Runs stages in dependency order. Evaluators within a stage are independent.
-    pub fn execute(&self, storage: &mut StorageEngine, timestamp_ms: i64) -> Result<(), String> {
+    pub fn execute(&self, storage: &mut BufferStore, timestamp_ms: i64) -> Result<(), String> {
         debug!(
             stage_count = self.stages.len(),
             timestamp_ms, "executing metric evaluation plan"
