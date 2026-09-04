@@ -1,19 +1,16 @@
 use std::{any::TypeId, collections::HashSet};
 
-use bci_metrics::{DuckDbStorageBackend, RawEegMetric, build_eeg_engine};
+use bci_metrics::{RawEegMetric, build_eeg_engine};
 use metric_engine::LiveSessionConfig;
 
 fn main() -> Result<(), String> {
     let engine = build_eeg_engine()?;
-    let mut live = engine.live_session(
-        LiveSessionConfig {
-            source_metrics: HashSet::from([TypeId::of::<RawEegMetric>()]),
-            buffer_size_ms: 30_000,
-            flush_interval_ms: 10_000,
-            output_metrics: None,
-        },
-        DuckDbStorageBackend::new("./eeg_sessions.db"),
-    )?;
+    let mut live = engine.live_session(LiveSessionConfig {
+        source_metrics: HashSet::from([TypeId::of::<RawEegMetric>()]),
+        buffer_size_ms: 30_000,
+        flush_interval_ms: 10_000,
+        output_metrics: None,
+    })?;
 
     live.feed_live_metric(RawEegMetric {
         tp9: 12.0,

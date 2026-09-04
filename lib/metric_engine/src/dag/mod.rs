@@ -1,5 +1,5 @@
 use crate::core::{MetricDependency, TickLedger};
-use crate::storage::BufferStore;
+use crate::engine::buffer_store::BufferStore;
 use crate::{MetricEvaluator, MetricGroup};
 use std::any::TypeId;
 use std::collections::{HashMap, HashSet, VecDeque};

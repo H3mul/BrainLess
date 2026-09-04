@@ -9,7 +9,27 @@ use std::sync::Arc;
 ///
 /// Metrics must be cloneable because the engine keeps bounded historical copies
 /// in its time-series buffers and passes read-only snapshots to evaluators.
-pub trait Metric: Send + Sync + Clone + Debug + 'static {}
+pub trait Metric: Send + Sync + Clone + Debug + 'static {
+    /// Target sampling cadence for this metric. This is the ground truth for
+    /// every interaction with the type: storage extraction rates and buffer
+    /// introspection (whether a buffer holds a valid sample for a timestamp).
+    /// Defaults to 256 Hz.
+    fn sample_rate() -> SampleRate {
+        SampleRate::Hz(256)
+    }
+}
+
+impl SampleRate {
+    /// Half-width of the timestamp window in which a sample counts as present
+    /// for a target timestamp under this rate. `Best` implies no assumed
+    /// cadence, so only an exact timestamp match counts.
+    pub fn tolerance_ms(&self) -> i64 {
+        match self {
+            SampleRate::Best => 0,
+            SampleRate::Hz(hz) => (1000 / *hz as i64).max(1),
+        }
+    }
+}
 
 /// Sampling policy requested by a window dependency.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -63,6 +83,45 @@ impl MetricDependency {
             },
         }
     }
+}
+
+fn max_sample_rate(current: SampleRate, requested: SampleRate) -> SampleRate {
+    match (current, requested) {
+        (SampleRate::Best, _) | (_, SampleRate::Best) => SampleRate::Best,
+        (SampleRate::Hz(current), SampleRate::Hz(requested)) => {
+            SampleRate::Hz(current.max(requested))
+        }
+    }
+}
+
+/// Longest history requested for a metric type across all dependencies, in
+/// milliseconds. Zero when no dependency asks for history.
+pub fn requested_history_ms(demand: &HashSet<MetricDependency>, type_id: TypeId) -> i64 {
+    demand
+        .iter()
+        .filter(|dependency| dependency.type_id == type_id)
+        .map(|dependency| match &dependency.request {
+            SampleRequest::Single(Age::SecondsAgo(seconds)) => *seconds as i64 * 1_000,
+            SampleRequest::Window {
+                start: Age::SecondsAgo(seconds),
+                ..
+            } => *seconds as i64 * 1_000,
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Highest sample rate requested for a metric type across all dependencies.
+pub fn requested_sample_rate(demand: &HashSet<MetricDependency>, type_id: TypeId) -> SampleRate {
+    demand
+        .iter()
+        .filter(|dependency| dependency.type_id == type_id)
+        .filter_map(|dependency| match &dependency.request {
+            SampleRequest::Window { rate, .. } => Some(rate.clone()),
+            _ => None,
+        })
+        .fold(SampleRate::Hz(256), max_sample_rate)
 }
 
 /// A metric value paired with its source timestamp.
@@ -134,6 +193,32 @@ impl<T: Metric> TimeSeriesBuffer<T> {
     /// Returns the underlying deque for read-only iteration.
     pub fn as_slice(&self) -> &VecDeque<MetricSample<T>> {
         &self.samples
+    }
+
+    /// Drops all samples older than `timestamp_ms`.
+    pub fn evict_before(&mut self, timestamp_ms: i64) {
+        while self
+            .samples
+            .front()
+            .is_some_and(|sample| sample.timestamp_ms < timestamp_ms)
+        {
+            self.samples.pop_front();
+        }
+    }
+
+    /// Returns the first sample within `tolerance_ms` of `timestamp_ms`.
+    pub fn sample_within(
+        &self,
+        timestamp_ms: i64,
+        tolerance_ms: i64,
+    ) -> Option<&MetricSample<T>> {
+        let lower = timestamp_ms.saturating_sub(tolerance_ms);
+        let candidate = self.samples.get(self.samples.partition_point(|s| s.timestamp_ms < lower))?;
+        if candidate.timestamp_ms <= timestamp_ms.saturating_add(tolerance_ms) {
+            Some(candidate)
+        } else {
+            None
+        }
     }
 
     /// Returns the number of samples currently retained.
@@ -274,8 +359,8 @@ pub trait MetricGroup: Send + Sync + 'static {
     /// Returns the concrete metric types contained in this output.
     fn type_ids() -> HashSet<TypeId>;
 
-    /// Commits the output values to the engine's storage buffers.
-    fn commit_to_storage(self, storage: &mut crate::storage::BufferStore, timestamp_ms: i64);
+    /// Commits the output values to the engine's buffer manager.
+    fn commit_to_storage(self, storage: &mut crate::engine::buffer_store::BufferStore, timestamp_ms: i64);
 }
 
 impl<T: Metric> MetricGroup for T {
@@ -283,7 +368,7 @@ impl<T: Metric> MetricGroup for T {
         HashSet::from([TypeId::of::<T>()])
     }
 
-    fn commit_to_storage(self, storage: &mut crate::storage::BufferStore, timestamp_ms: i64) {
+    fn commit_to_storage(self, storage: &mut crate::engine::buffer_store::BufferStore, timestamp_ms: i64) {
         storage.commit_sample(MetricSample {
             timestamp_ms,
             data: self,
@@ -296,7 +381,7 @@ impl<A: Metric, B: Metric> MetricGroup for (A, B) {
         HashSet::from([TypeId::of::<A>(), TypeId::of::<B>()])
     }
 
-    fn commit_to_storage(self, storage: &mut crate::storage::BufferStore, timestamp_ms: i64) {
+    fn commit_to_storage(self, storage: &mut crate::engine::buffer_store::BufferStore, timestamp_ms: i64) {
         storage.commit_sample(MetricSample {
             timestamp_ms,
             data: self.0,

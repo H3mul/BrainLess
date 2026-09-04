@@ -1,6 +1,7 @@
 use crate::core::{Metric, MetricSample, TickOutputLedger};
 use crate::dag::DagGraphTraversal;
-use crate::{BufferStore, DagGraph, ExecutionMode, MetricEngine, StorageBackend};
+use crate::engine::buffer_store::BufferStore;
+use crate::{DagGraph, ExecutionMode, MetricEngine};
 use std::any::TypeId;
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -38,11 +39,7 @@ pub struct LiveSession {
 }
 
 impl LiveSession {
-    pub(crate) fn new(
-        config: LiveSessionConfig,
-        backend: Box<dyn StorageBackend>,
-        engine: &MetricEngine,
-    ) -> Self {
+    pub(crate) fn new(config: LiveSessionConfig, engine: &MetricEngine) -> Self {
         let graph = DagGraph::new(engine.evaluators.clone()).expect("failed to compile metric dag");
 
         // If output_metrics is not specified, default to all metrics in the engine.
@@ -59,7 +56,7 @@ impl LiveSession {
             )
             .expect("failed to traverse metric dag");
 
-        let mut storage = BufferStore::new(config.flush_interval_ms, backend);
+        let mut storage = BufferStore::new();
 
         for metric in &engine.metrics {
             (metric.register)(
@@ -113,7 +110,6 @@ impl LiveSession {
         self.dependency_traversal
             .execution_plan
             .execute(&mut self.storage, timestamp_ms)?;
-        self.storage.maybe_flush(timestamp_ms)?;
         Ok(TickOutputLedger::new(
             self.storage.provision_output_ledger(timestamp_ms),
         ))

@@ -9,11 +9,13 @@ pub trait StorageBackend: Send + Sync {
         false
     }
     /// Writes a batch of rows to a metric table.
+    ///
+    /// Each row is the list of parameter values for `schema_columns`, in order.
     fn flush_batch(
         &mut self,
         table_name: &str,
         schema_columns: &[&str],
-        row_values: &[String],
+        row_values: &[Vec<String>],
     ) -> Result<(), String>;
 
     /// Fetches historic rows for an explicit timestamp range.
@@ -45,7 +47,7 @@ impl StorageBackend for NoopStorageBackend {
     fn is_noop(&self) -> bool {
         true
     }
-    fn flush_batch(&mut self, _: &str, _: &[&str], _: &[String]) -> Result<(), String> {
+    fn flush_batch(&mut self, _: &str, _: &[&str], _: &[Vec<String>]) -> Result<(), String> {
         Ok(())
     }
 

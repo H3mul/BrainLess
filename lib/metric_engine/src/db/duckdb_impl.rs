@@ -23,7 +23,7 @@ impl StorageBackend for DuckDbStorageBackend {
         &mut self,
         table: &str,
         columns: &[&str],
-        rows: &[String],
+        rows: &[Vec<String>],
     ) -> Result<(), String> {
         self.flushed_rows += rows.len();
         info!(

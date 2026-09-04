@@ -1,9 +1,10 @@
-use crate::NoopStorageBackend;
 use crate::core::{Metric, MetricDependency, MetricEvaluator, MetricGroup};
 use crate::dag::ErasedEvaluator;
+pub mod buffer_store;
 pub mod sessions;
 use self::sessions::{LiveSession, LiveSessionConfig};
-use crate::storage::{BufferStore, PersistentMetric, StorageBackend};
+use crate::db::persistence::PersistentMetric;
+use crate::engine::buffer_store::BufferStore;
 use std::any::TypeId;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
@@ -11,8 +12,11 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 /// Erased buffer registration for a metric type. A plain function pointer: the
-/// constructors never capture state, so every registration is guaranteed to have
-/// one and no metric can silently lack a buffer.
+/// constructors never capture state, so every registration is guaranteed to
+/// have one.
+///
+/// Persistence wiring (driver, backend, historic loads) is deliberately kept
+/// out of registration for now; it returns with the replay session work.
 type BufferRegistration =
     fn(&mut BufferStore, i64, &HashSet<MetricDependency>) -> Result<(), String>;
 
@@ -69,8 +73,8 @@ impl MetricRegistration {
         Self {
             metric_type: TypeId::of::<T>(),
             persistence: false,
-            register: |storage, buffer_size_ms, _demand| {
-                storage.register_ephemeral_buffer::<T>(buffer_size_ms);
+            register: |storage, buffer_size_ms, demand| {
+                storage.register_buffer::<T>(buffer_size_ms, demand);
                 Ok(())
             },
         }
@@ -79,7 +83,10 @@ impl MetricRegistration {
         Self {
             metric_type: TypeId::of::<T>(),
             persistence: true,
-            register: BufferStore::register_buffer::<T>,
+            register: |storage, buffer_size_ms, demand| {
+                storage.register_buffer::<T>(buffer_size_ms, demand);
+                Ok(())
+            },
         }
     }
 }
@@ -172,21 +179,8 @@ impl MetricEngine {
     pub fn builder() -> MetricEngineBuilder {
         MetricEngineBuilder::new()
     }
-    pub fn live_session(
-        &self,
-        config: LiveSessionConfig,
-        backend: impl StorageBackend + 'static,
-    ) -> Result<LiveSession, String> {
-        if backend.is_noop() && self.metrics.iter().any(|metric| metric.persistence) {
-            return Err(
-                "ephemeral live sessions cannot use persistent metric registrations".into(),
-            );
-        }
-        Ok(LiveSession::new(config, Box::new(backend), self))
-    }
-
-    pub fn ephemeral_live_session(&self, config: LiveSessionConfig) -> Result<LiveSession, String> {
-        self.live_session(config, NoopStorageBackend)
+    pub fn live_session(&self, config: LiveSessionConfig) -> Result<LiveSession, String> {
+        Ok(LiveSession::new(config, self))
     }
     // pub fn replay_session(
     //     &self,
