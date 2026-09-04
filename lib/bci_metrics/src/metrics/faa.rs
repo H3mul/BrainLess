@@ -5,7 +5,11 @@ use metric_engine::{Metric, PersistentMetric};
 pub struct FaaMetric {
     pub faa: f32,
 }
-impl Metric for FaaMetric {}
+impl Metric for FaaMetric {
+    fn id() -> &'static str {
+        "faa"
+    }
+}
 
 /// DuckDB schema and row conversion for frontal alpha asymmetry.
 impl PersistentMetric for FaaMetric {

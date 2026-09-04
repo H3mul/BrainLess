@@ -1,72 +1,168 @@
-use crate::core::{
-    requested_history_ms, ErasedSeries, Metric, MetricDependency, MetricSample, TickLedger,
-    TimeSeriesBuffer,
-};
-use std::any::{Any, TypeId};
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use crate::engine::core::requested_history_ms;
+use crate::{Metric, MetricDependency, MetricId, MetricSample};
+use std::any::Any;
+use std::collections::{HashMap, HashSet, VecDeque};
 use tracing::debug;
 
-/// Type-erased in-memory buffer operations used by [`BufferStore`].
+/// Bounded time-ordered buffer of metric samples for one metric type.
 ///
-/// The store is storage agnostic: buffers hold samples, route commits, and
-/// answer introspection queries. Persistence concerns (row encoding, SQL
-/// parsing, flushing) live in [`crate::db::persistence`].
-trait MetricBufferTrait: Send + Sync {
-    fn clone_to_any(&self) -> Arc<dyn ErasedSeries>;
-
-    fn commit_any(&mut self, sample: Box<dyn Any + Send + Sync>);
-
-    fn latest_erased(&self) -> Option<Box<dyn Any + Send + Sync>>;
-
-    /// Returns `(timestamp, data)` pairs for samples newer than `watermark`,
-    /// ascending by timestamp. The data is the typed metric value, erased.
-    fn samples_since(&self, watermark: i64) -> Vec<(i64, Box<dyn Any + Send + Sync>)>;
-
-    /// Whether a sample exists within `tolerance_ms` of `timestamp_ms`.
-    fn has_value_within(&self, timestamp_ms: i64, tolerance_ms: i64) -> bool;
-
-    /// Drops all samples older than `timestamp_ms`.
-    fn evict_before(&mut self, timestamp_ms: i64);
+/// Samples are kept sorted and deduplicated by timestamp. The buffer does not
+/// enforce a retention window on its own; use [`TimeSeriesBuffer::evict_before`]
+/// (or [`BufferStore::evict_before`]) to drop stale samples.
+#[derive(Debug, Clone)]
+pub struct TimeSeriesBuffer<T: Metric> {
+    pub samples: VecDeque<MetricSample<T>>,
 }
 
-/// Bounded in-memory buffer for one metric type.
-struct MetricBuffer<T: Metric> {
-    buffer: Arc<TimeSeriesBuffer<T>>,
-}
-
-impl<T: Metric> MetricBufferTrait for MetricBuffer<T> {
-    fn clone_to_any(&self) -> Arc<dyn ErasedSeries> {
-        self.buffer.clone()
-    }
-
-    fn commit_any(&mut self, sample: Box<dyn Any + Send + Sync>) {
-        if let Ok(sample) = sample.downcast::<MetricSample<T>>() {
-            Arc::make_mut(&mut self.buffer).push_sample(*sample);
+impl<T: Metric> TimeSeriesBuffer<T> {
+    pub fn new() -> Self {
+        Self {
+            samples: VecDeque::new(),
         }
     }
 
-    fn latest_erased(&self) -> Option<Box<dyn Any + Send + Sync>> {
-        self.buffer.latest().cloned().map(|s| Box::new(s) as _)
+    /// Appends an already timestamped sample.
+    pub fn push_sample(&mut self, sample: MetricSample<T>) {
+        self.push_samples(vec![sample]);
     }
 
-    fn samples_since(&self, watermark: i64) -> Vec<(i64, Box<dyn Any + Send + Sync>)> {
-        self.buffer
-            .as_slice()
+    /// Pushes samples, sorting and deduplicating by timestamp.
+    pub fn push_samples(&mut self, historic: Vec<MetricSample<T>>) {
+        let mut all: Vec<_> = self.samples.drain(..).chain(historic).collect();
+        all.sort_by_key(|s| s.timestamp_ms);
+        all.dedup_by_key(|s| s.timestamp_ms);
+        self.samples = all.into_iter().collect();
+    }
+
+    /// Returns the newest sample, if one is available.
+    pub fn get_sample_latest(&self) -> Option<&MetricSample<T>> {
+        self.samples.back()
+    }
+
+    /// Returns the samples within the given timestamp window, sorted by
+    /// timestamp. Returns an empty vec when the window is empty or invalid
+    /// (`start_ts > end_ts`).
+    pub fn get_samples_in_ts_window(&self, start_ts: i64, end_ts: i64) -> Vec<MetricSample<T>> {
+        let start_idx = self.samples.partition_point(|s| s.timestamp_ms < start_ts);
+        let end_idx = self.samples.partition_point(|s| s.timestamp_ms <= end_ts);
+        self.samples
             .iter()
-            .filter(|s| s.timestamp_ms > watermark)
-            .map(|s| (s.timestamp_ms, Box::new(s.data.clone()) as _))
+            .skip(start_idx)
+            .take(end_idx.saturating_sub(start_idx))
+            .cloned()
             .collect()
     }
 
-    fn has_value_within(&self, timestamp_ms: i64, tolerance_ms: i64) -> bool {
-        self.buffer
-            .sample_within(timestamp_ms, tolerance_ms)
-            .is_some()
+    /// Returns the underlying deque for read-only iteration.
+    pub fn get_samples(&self) -> &VecDeque<MetricSample<T>> {
+        &self.samples
     }
 
-    fn evict_before(&mut self, timestamp_ms: i64) {
-        Arc::make_mut(&mut self.buffer).evict_before(timestamp_ms);
+    /// Return the last sample for or before the given timestamp, if any
+    /// Returns the first sample with `ts <= timestamp` — the sample at the
+    /// timestamp if one exists, otherwise the closest sample in the past.
+    pub fn get_sample_last_before_ts(&self, timestamp_ms: i64) -> Option<&MetricSample<T>> {
+        let index = self
+            .samples
+            .partition_point(|s| s.timestamp_ms <= timestamp_ms);
+        self.samples.get(index.checked_sub(1)?)
+    }
+
+    /// Returns the sample with `timestamp - tolerance <= ts <= timestamp`
+    /// (per the Metric's sample rate), if any.
+    pub fn get_sample_for_ts(&self, timestamp_ms: i64) -> Option<&MetricSample<T>> {
+        let tolerance_ms = T::sample_rate().tolerance_ms();
+        let candidate = self.get_sample_last_before_ts(timestamp_ms)?;
+        if candidate.timestamp_ms >= timestamp_ms.saturating_sub(tolerance_ms) {
+            Some(candidate)
+        } else {
+            None
+        }
+    }
+
+    /// Drops all samples older than the provided age, relative to the newest
+    /// sample in the buffer.
+    fn evict_samples_older_than_ts(&mut self, age_ts: i64) {
+        let Some(newest_timestamp_ms) = self.samples.back().map(|sample| sample.timestamp_ms)
+        else {
+            return;
+        };
+        self.evict_samples_before_ts(newest_timestamp_ms.saturating_sub(age_ts));
+    }
+
+    /// Drops all samples older than `timestamp_ms`.
+    pub fn evict_samples_before_ts(&mut self, timestamp_ms: i64) {
+        while self
+            .samples
+            .front()
+            .is_some_and(|sample| sample.timestamp_ms < timestamp_ms)
+        {
+            self.samples.pop_front();
+        }
+    }
+
+    /// Returns the number of samples currently retained.
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    /// Returns whether the buffer contains no samples.
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+}
+
+/// Type-erased operations over a [`TimeSeriesBuffer`], used by
+/// [`BufferStore`] and [`TickLedger`] to interact with buffers of any metric
+/// type without knowing `T`.
+pub(crate) trait ErasedTimeSeriesBuffer: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+
+    fn type_name(&self) -> &'static str;
+
+    /// `(timestamp, debug-formatted value)` pairs for every retained sample.
+    fn debug_rows(&self) -> Vec<(i64, String)>;
+}
+
+impl<T: Metric> ErasedTimeSeriesBuffer for TimeSeriesBuffer<T> {
+    #[inline]
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    #[inline]
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<T>()
+    }
+
+    fn debug_rows(&self) -> Vec<(i64, String)> {
+        self.samples
+            .iter()
+            .map(|sample| (sample.timestamp_ms, format!("{:?}", sample.data)))
+            .collect()
+    }
+}
+
+/// A read-only immutable view of the buffer store to pass to Evaluators and out
+/// of the engine.
+pub struct ReadOnlyBufferStore<'a> {
+    store: &'a BufferStore,
+}
+impl<'a> ReadOnlyBufferStore<'a> {
+    #[inline]
+    pub fn new(store: &'a BufferStore) -> Self {
+        Self { store }
+    }
+
+    /// Direct typed accessor to concrete TimeSeriesBuffer<T>
+    #[inline]
+    pub fn get_buffer<T: Metric>(&self) -> Option<&'a TimeSeriesBuffer<T>> {
+        self.store.get_buffer::<T>()
     }
 }
 
@@ -78,7 +174,7 @@ impl<T: Metric> MetricBufferTrait for MetricBuffer<T> {
 /// queries (latest sample, sample presence, eviction). Persistent storage
 /// interaction lives in [`crate::db::persistence`].
 pub struct BufferStore {
-    buffers: HashMap<TypeId, Box<dyn MetricBufferTrait>>,
+    buffers: HashMap<MetricId, Box<dyn ErasedTimeSeriesBuffer>>,
 }
 
 impl BufferStore {
@@ -96,125 +192,56 @@ impl BufferStore {
         buffer_size_ms: i64,
         demand: &HashSet<MetricDependency>,
     ) {
-        let metric_type = TypeId::of::<T>();
-        let requested_history_ms = requested_history_ms(demand, metric_type);
+        let metric_id = MetricId::of::<T>();
+        let requested_history_ms = requested_history_ms(demand, metric_id);
         let effective_buffer_size_ms = buffer_size_ms.max(requested_history_ms).max(1);
 
         debug!(
-            metric_type = ?metric_type,
+            metric_id = ?metric_id,
             buffer_size_ms = effective_buffer_size_ms,
             requested_history_ms,
             "registering metric buffer"
         );
 
-        self.buffers.insert(
-            metric_type,
-            Box::new(MetricBuffer::<T> {
-                buffer: Arc::new(TimeSeriesBuffer::<T>::with_time_capacity_ms(
-                    effective_buffer_size_ms,
-                )),
-            }),
-        );
+        self.buffers
+            .insert(metric_id, Box::new(TimeSeriesBuffer::<T>::new()));
     }
 
-    /// Commits a typed sample to its registered buffer.
-    pub fn commit_sample<T: Metric>(&mut self, sample: MetricSample<T>) {
-        let metric_type = TypeId::of::<T>();
+    #[inline]
+    pub fn get_buffer<T: Metric>(&self) -> Option<&TimeSeriesBuffer<T>> {
+        let metric_id = MetricId::of::<T>();
+        self.buffers
+            .get(&metric_id)?
+            .as_ref()
+            .as_any()
+            .downcast_ref::<TimeSeriesBuffer<T>>()
+    }
+
+    #[inline]
+    pub fn get_buffer_mut<T: Metric>(&mut self) -> Option<&mut TimeSeriesBuffer<T>> {
+        let metric_id = MetricId::of::<T>();
+        self.buffers
+            .get_mut(&metric_id)?
+            .as_any_mut()
+            .downcast_mut::<TimeSeriesBuffer<T>>()
+    }
+
+    #[inline]
+    pub fn push_sample<T: Metric>(&mut self, sample: MetricSample<T>) {
+        let metric_id = MetricId::of::<T>();
         debug!(
-            ?metric_type,
+            ?metric_id,
             timestamp_ms = sample.timestamp_ms,
             "committing metric sample to buffer"
         );
-        self.commit_erased(metric_type, Box::new(sample));
-    }
-
-    /// Commits an already-boxed sample to the buffer registered for
-    /// `type_id`.
-    fn commit_erased(&mut self, type_id: TypeId, sample: Box<dyn Any + Send + Sync>) {
-        if let Some(buf) = self.buffers.get_mut(&type_id) {
-            buf.commit_any(sample);
-        } else {
-            debug!(
-                ?type_id,
-                "discarding sample because no metric buffer is registered"
-            );
-        }
-    }
-
-    /// Returns `(timestamp, data)` pairs for samples newer than `watermark`,
-    /// ascending by timestamp. The data is the typed metric value, erased.
-    /// Used by the persistence layer to drain flushable samples.
-    pub(crate) fn samples_since(
-        &self,
-        type_id: TypeId,
-        watermark: i64,
-    ) -> Vec<(i64, Box<dyn Any + Send + Sync>)> {
-        self.buffers
-            .get(&type_id)
-            .map(|buf| buf.samples_since(watermark))
-            .unwrap_or_default()
-    }
-
-    /// Clones the requested buffers into a read-pass ledger.
-    pub fn provision_ledger(
-        &self,
-        timestamp_ms: i64,
-        demand: &HashSet<crate::core::MetricDependency>,
-    ) -> TickLedger {
-        debug!(
-            timestamp_ms,
-            dependency_count = demand.len(),
-            "provisioning metric tick ledger"
-        );
-        let mut ledger = TickLedger::new(timestamp_ms);
-
-        for dep in demand {
-            if let Some(buf) = self.buffers.get(&dep.type_id) {
-                ledger.insert_erased(dep.type_id, buf.clone_to_any());
+        match self.get_buffer_mut::<T>() {
+            Some(buffer) => {
+                buffer.push_sample(sample);
             }
+            None => debug!(
+                ?metric_id,
+                "discarding sample because no metric buffer is registered"
+            ),
         }
-
-        ledger
-    }
-
-    /// Provisions the complete buffer state for external consumption after a tick.
-    pub fn provision_output_ledger(&self, timestamp_ms: i64) -> TickLedger {
-        let mut ledger = TickLedger::new(timestamp_ms);
-        for (type_id, buffer) in &self.buffers {
-            ledger.insert_erased(*type_id, buffer.clone_to_any());
-        }
-        ledger
-    }
-
-    /// Returns the newest sample for a type-erased metric.
-    pub fn latest_erased(&self, id: TypeId) -> Option<Box<dyn Any + Send + Sync>> {
-        self.buffers.get(&id).and_then(|b| b.latest_erased())
-    }
-
-    /// Drops samples older than `timestamp_ms` from every buffer.
-    pub fn evict_before(&mut self, timestamp_ms: i64) {
-        debug!(timestamp_ms, "evicting samples from metric buffers");
-        for buf in self.buffers.values_mut() {
-            buf.evict_before(timestamp_ms);
-        }
-    }
-
-    /// Whether the buffer for `T` holds a valid sample for `timestamp_ms`:
-    /// a sample within the metric's target sample rate of the timestamp.
-    /// If true, the metric does not need to be evaluated for this timestamp.
-    pub fn has_value_at<T: Metric>(&self, timestamp_ms: i64) -> bool {
-        self.has_value_within(
-            TypeId::of::<T>(),
-            timestamp_ms,
-            T::sample_rate().tolerance_ms(),
-        )
-    }
-
-    /// Type-erased variant of [`BufferStore::has_value_at`] with an explicit
-    /// tolerance, for callers that only hold `TypeId`s.
-    pub fn has_value_within(&self, type_id: TypeId, timestamp_ms: i64, tolerance_ms: i64) -> bool {
-        self.buffers
-            .get(&type_id)
-            .is_some_and(|buf| buf.has_value_within(timestamp_ms, tolerance_ms))
     }
 }

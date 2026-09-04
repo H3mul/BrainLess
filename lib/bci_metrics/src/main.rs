@@ -1,12 +1,12 @@
-use std::{any::TypeId, collections::HashSet};
+use std::collections::HashSet;
 
 use bci_metrics::{RawEegMetric, build_eeg_engine};
-use metric_engine::LiveSessionConfig;
+use metric_engine::{LiveSessionConfig, MetricId};
 
 fn main() -> Result<(), String> {
     let engine = build_eeg_engine()?;
     let mut live = engine.live_session(LiveSessionConfig {
-        source_metrics: HashSet::from([TypeId::of::<RawEegMetric>()]),
+        source_metrics: HashSet::from([MetricId::of::<RawEegMetric>()]),
         buffer_size_ms: 30_000,
         flush_interval_ms: 10_000,
         output_metrics: None,

@@ -2,7 +2,7 @@
 ///
 /// The engine supplies table metadata and pre-formatted rows; the backend owns
 /// connections, transactions, retries, and historic data access.
-use crate::core::SampleRate;
+use crate::engine::core::SampleRate;
 
 pub trait StorageBackend: Send + Sync {
     fn is_noop(&self) -> bool {

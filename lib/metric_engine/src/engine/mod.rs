@@ -1,15 +1,18 @@
-use crate::core::{Metric, MetricDependency, MetricEvaluator, MetricGroup};
-use crate::dag::ErasedEvaluator;
 pub mod buffer_store;
+pub mod core;
 pub mod sessions;
-use self::sessions::{LiveSession, LiveSessionConfig};
-use crate::db::persistence::PersistentMetric;
-use crate::engine::buffer_store::BufferStore;
-use std::any::TypeId;
+
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tracing::{info, warn};
+
+use self::core::{Metric, MetricDependency, MetricEvaluator, MetricGroup, MetricId};
+use self::sessions::{LiveSession, LiveSessionConfig};
+
+use crate::dag::ErasedEvaluator;
+use crate::db::persistence::PersistentMetric;
+use crate::engine::buffer_store::BufferStore;
 
 /// Erased buffer registration for a metric type. A plain function pointer: the
 /// constructors never capture state, so every registration is guaranteed to
@@ -49,21 +52,21 @@ where
 
 #[derive(Clone, Copy)]
 pub struct MetricRegistration {
-    pub(crate) metric_type: TypeId,
+    pub(crate) metric_id: MetricId,
     pub(crate) persistence: bool,
     pub(crate) register: BufferRegistration,
 }
 
 impl PartialEq for MetricRegistration {
     fn eq(&self, other: &Self) -> bool {
-        self.metric_type == other.metric_type && self.persistence == other.persistence
+        self.metric_id == other.metric_id && self.persistence == other.persistence
     }
 }
 
 impl Eq for MetricRegistration {}
 impl Hash for MetricRegistration {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.metric_type.hash(state);
+        self.metric_id.hash(state);
         self.persistence.hash(state);
     }
 }
@@ -71,7 +74,7 @@ impl Hash for MetricRegistration {
 impl MetricRegistration {
     pub fn ephemeral<T: Metric>() -> Self {
         Self {
-            metric_type: TypeId::of::<T>(),
+            metric_id: MetricId::of::<T>(),
             persistence: false,
             register: |storage, buffer_size_ms, demand| {
                 storage.register_buffer::<T>(buffer_size_ms, demand);
@@ -81,7 +84,7 @@ impl MetricRegistration {
     }
     pub fn persistent<T: PersistentMetric>() -> Self {
         Self {
-            metric_type: TypeId::of::<T>(),
+            metric_id: MetricId::of::<T>(),
             persistence: true,
             register: |storage, buffer_size_ms, demand| {
                 storage.register_buffer::<T>(buffer_size_ms, demand);
@@ -127,7 +130,7 @@ impl MetricEngineBuilder {
                     &evaluator
                         .dependencies()
                         .into_iter()
-                        .map(|d| d.type_id)
+                        .map(|d| d.metric_id)
                         .collect(),
                 )
                 .copied()

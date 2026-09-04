@@ -1,26 +1,17 @@
-use crate::core::{MetricDependency, TickLedger};
-use crate::engine::buffer_store::BufferStore;
+use crate::engine::core::{MetricDependency, MetricId};
 use crate::{MetricEvaluator, MetricGroup};
-use std::any::TypeId;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use tracing::debug;
 
 /// Object-safe evaluator interface used by the compiled execution plan.
 pub trait ErasedEvaluator: Send + Sync {
     /// Stable evaluator identifier.
     fn id(&self) -> &'static str;
     /// Concrete metric types produced by the evaluator.
-    fn produces(&self) -> HashSet<TypeId>;
+    fn produces(&self) -> HashSet<MetricId>;
     /// Dependencies required by the evaluator.
     fn dependencies(&self) -> HashSet<MetricDependency>;
-    /// Evaluates and commits the erased output to storage.
-    fn evaluate_and_commit(
-        &self,
-        ledger: &TickLedger,
-        storage: &mut BufferStore,
-        timestamp_ms: i64,
-    ) -> Result<(), String>;
 }
 
 impl<E> ErasedEvaluator for E
@@ -29,23 +20,13 @@ where
     E::Output: MetricGroup,
 {
     fn id(&self) -> &'static str {
-        <E as MetricEvaluator>::id(self)
+        <E as MetricEvaluator>::id()
     }
-    fn produces(&self) -> HashSet<TypeId> {
+    fn produces(&self) -> HashSet<MetricId> {
         E::Output::type_ids()
     }
     fn dependencies(&self) -> HashSet<MetricDependency> {
         <E as MetricEvaluator>::dependencies(self)
-    }
-    fn evaluate_and_commit(
-        &self,
-        ledger: &TickLedger,
-        storage: &mut BufferStore,
-        timestamp_ms: i64,
-    ) -> Result<(), String> {
-        self.evaluate(ledger)?
-            .commit_to_storage(storage, timestamp_ms);
-        Ok(())
     }
 }
 
@@ -66,36 +47,6 @@ pub struct ExecutionPlan {
     pub mode: ExecutionMode,
 }
 
-impl ExecutionPlan {
-    /// Runs stages in dependency order. Evaluators within a stage are independent.
-    pub fn execute(&self, storage: &mut BufferStore, timestamp_ms: i64) -> Result<(), String> {
-        debug!(
-            stage_count = self.stages.len(),
-            timestamp_ms, "executing metric evaluation plan"
-        );
-        for (stage_index, stage) in self.stages.iter().enumerate() {
-            debug!(
-                stage = stage_index,
-                evaluator_count = stage.evaluators.len(),
-                timestamp_ms,
-                "executing metric stage"
-            );
-            for evaluator in &stage.evaluators {
-                debug!(
-                    evaluator = evaluator.id(),
-                    stage = stage_index,
-                    timestamp_ms,
-                    "evaluating metric"
-                );
-                let dependency_ledger =
-                    storage.provision_ledger(timestamp_ms, &evaluator.dependencies());
-                evaluator.evaluate_and_commit(&dependency_ledger, storage, timestamp_ms)?
-            }
-        }
-        Ok(())
-    }
-}
-
 pub struct DagGraphTraversal {
     // Stages of parallel execution of Evaluators.
     pub execution_plan: ExecutionPlan,
@@ -113,7 +64,7 @@ pub struct DagGraph {
     evaluators: Vec<Arc<dyn ErasedEvaluator>>,
 
     // map of metric type to the index of the evaluator that produces it
-    producers: HashMap<TypeId, usize>,
+    producers: HashMap<MetricId, usize>,
     // Map of evaluator index to list of evaluator indexes that depend on it (Producer -> Consumers)
     edges: Vec<Vec<usize>>,
 }
@@ -127,11 +78,11 @@ impl DagGraph {
         // Map of metric type to the index of the evaluator that produces it
         let mut producers = HashMap::new();
         for (index, evaluator) in evaluators.iter().enumerate() {
-            for metric_type in evaluator.produces() {
-                if producers.insert(metric_type, index).is_some() {
+            for metric_id in evaluator.produces() {
+                if producers.insert(metric_id, index).is_some() {
                     return Err(format!(
                         "Multiple evaluators produce metric type {:?}",
-                        metric_type
+                        metric_id
                     ));
                 }
             }
@@ -141,7 +92,7 @@ impl DagGraph {
         let mut edges = vec![Vec::new(); evaluators.len()];
         for (consumer, evaluator) in evaluators.iter().enumerate() {
             for dependency in evaluator.dependencies() {
-                if let Some(&producer) = producers.get(&dependency.type_id) {
+                if let Some(&producer) = producers.get(&dependency.metric_id) {
                     if producer != consumer && !edges[producer].contains(&consumer) {
                         edges[producer].push(consumer);
                     }
@@ -162,8 +113,8 @@ impl DagGraph {
     /// and advance the traversal to the next dependency layer.
     pub fn traverse(
         &self,
-        source_metrics: &HashSet<TypeId>,
-        target_metrics: &HashSet<TypeId>,
+        source_metrics: &HashSet<MetricId>,
+        target_metrics: &HashSet<MetricId>,
         mode: ExecutionMode,
     ) -> Result<DagGraphTraversal, String> {
         // Set of evaluator indexes that are required to produce the requested target metrics
@@ -172,17 +123,17 @@ impl DagGraph {
         // Set of metric types that have been visited during the traversal
         let mut visited = HashSet::new();
         // Operational queue of metric types to figure out producers for. Start with the requested target metrics and work backwards to their dependencies.
-        let mut work: Vec<TypeId> = target_metrics.iter().copied().collect();
-        while let Some(metric_type) = work.pop() {
+        let mut work: Vec<MetricId> = target_metrics.iter().copied().collect();
+        while let Some(metric_id) = work.pop() {
             // Already accounted for this metric's producers, or it's a source metric
             // Note: this means if a metric is in both in sources and targets = no action.
-            if !visited.insert(metric_type) || source_metrics.contains(&metric_type) {
+            if !visited.insert(metric_id) || source_metrics.contains(&metric_id) {
                 continue;
             }
 
             // Fetch metric's producer and add it to the required set
-            let evaluator_index = self.producers.get(&metric_type).copied()
-                .ok_or_else(|| format!("Metric type {:?} is required but has no evaluator producer and was not declared as a source", metric_type))?;
+            let evaluator_index = self.producers.get(&metric_id).copied()
+                .ok_or_else(|| format!("Metric type {:?} is required but has no evaluator producer and was not declared as a source", metric_id))?;
 
             if required_producers.insert(evaluator_index) {
                 // If this is a newly discovered required producer, add its dependencies to the work queue to be resolved
@@ -190,7 +141,7 @@ impl DagGraph {
                     self.evaluators[evaluator_index]
                         .dependencies()
                         .into_iter()
-                        .map(|dependency| dependency.type_id),
+                        .map(|dependency| dependency.metric_id),
                 );
             }
         }

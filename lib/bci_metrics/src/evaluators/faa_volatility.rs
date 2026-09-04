@@ -7,7 +7,7 @@ pub struct FaaVolatilityEvaluator;
 
 impl MetricEvaluator for FaaVolatilityEvaluator {
     type Output = FaaVolatilityMetric;
-    fn id(&self) -> &'static str {
+    fn id() -> &'static str {
         "faa_volatility_evaluator"
     }
     fn dependencies(&self) -> HashSet<MetricDependency> {

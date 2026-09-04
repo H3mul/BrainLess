@@ -1,7 +1,11 @@
-use crate::core::{requested_history_ms, requested_sample_rate, Metric, MetricDependency, MetricSample, SampleRate};
 use crate::db::backend::StorageBackend;
 use crate::engine::buffer_store::BufferStore;
-use std::any::{Any, TypeId};
+use crate::engine::core::{
+    Metric, MetricDependency, MetricId, MetricSample, SampleRate, requested_history_ms,
+    requested_sample_rate,
+};
+
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, info};
 
@@ -64,8 +68,8 @@ fn encode_sample<T: PersistentMetric>(
 /// The buffer manager stays storage agnostic; this type owns the flush
 /// watermarks, the per-type row codecs, and the backend interaction.
 pub struct PersistenceDriver {
-    codecs: HashMap<TypeId, SampleCodec>,
-    flush_watermarks: HashMap<TypeId, i64>,
+    codecs: HashMap<MetricId, SampleCodec>,
+    flush_watermarks: HashMap<MetricId, i64>,
     last_flush_timestamp_ms: i64,
     flush_interval_ms: i64,
 }
@@ -95,23 +99,23 @@ impl PersistenceDriver {
         demand: &HashSet<MetricDependency>,
         backend: &dyn StorageBackend,
     ) -> Result<(), String> {
-        let metric_type = TypeId::of::<T>();
+        let metric_id = MetricId::of::<T>();
         let effective_buffer_size_ms = buffer_size_ms.max(self.flush_interval_ms);
 
         debug!(
-            metric_type = ?metric_type,
+            metric_id = ?metric_id,
             buffer_size_ms = effective_buffer_size_ms,
             persistent = true,
             "registering persistent metric buffer"
         );
 
         store.register_buffer::<T>(effective_buffer_size_ms, demand);
-        self.codecs.insert(metric_type, SampleCodec::of::<T>());
-        self.flush_watermarks.entry(metric_type).or_insert(0);
+        self.codecs.insert(metric_id, SampleCodec::of::<T>());
+        self.flush_watermarks.entry(metric_id).or_insert(0);
 
-        let requested_history_ms = requested_history_ms(demand, metric_type);
+        let requested_history_ms = requested_history_ms(demand, metric_id);
         if requested_history_ms > 0 {
-            let sample_rate = requested_sample_rate(demand, metric_type);
+            let sample_rate = requested_sample_rate(demand, metric_id);
             self.load_historic::<T>(store, requested_history_ms, sample_rate, backend)?;
         }
         Ok(())
@@ -126,7 +130,7 @@ impl PersistenceDriver {
         backend: &dyn StorageBackend,
     ) -> Result<(), String> {
         debug!(
-            metric_type = ?TypeId::of::<T>(),
+            metric_id = ?MetricId::of::<T>(),
             window_ms,
             ?sample_rate,
             "loading historic metric window"
@@ -145,7 +149,7 @@ impl PersistenceDriver {
         backend: &dyn StorageBackend,
     ) -> Result<(), String> {
         debug!(
-            metric_type = ?TypeId::of::<T>(),
+            metric_id = ?MetricId::of::<T>(),
             start_ms,
             end_ms,
             ?sample_rate,
@@ -168,7 +172,7 @@ impl PersistenceDriver {
             let timestamp_ms = fields[0]
                 .parse::<i64>()
                 .map_err(|error| error.to_string())?;
-            store.commit_sample(MetricSample {
+            store.push_sample(MetricSample {
                 timestamp_ms,
                 data: T::from_sql_row(&fields[1..])?,
             });
@@ -195,9 +199,9 @@ impl PersistenceDriver {
             "flushing metric buffers to persistent storage"
         );
         let mut flushed_buffer_count = 0;
-        for (type_id, codec) in &self.codecs {
-            let watermark = *self.flush_watermarks.get(type_id).unwrap_or(&0);
-            let samples = store.samples_since(*type_id, watermark);
+        for (metric_id, codec) in &self.codecs {
+            let watermark = *self.flush_watermarks.get(metric_id).unwrap_or(&0);
+            let samples = store.samples_since(*metric_id, watermark);
             if samples.is_empty() {
                 continue;
             }
@@ -214,14 +218,11 @@ impl PersistenceDriver {
                 .unwrap_or(watermark);
 
             backend.flush_batch(codec.table, codec.columns, &rows)?;
-            self.flush_watermarks.insert(*type_id, high_watermark);
+            self.flush_watermarks.insert(*metric_id, high_watermark);
         }
 
         self.last_flush_timestamp_ms = timestamp_ms;
-        info!(
-            flushed_buffer_count,
-            "metric storage flush completed"
-        );
+        info!(flushed_buffer_count, "metric storage flush completed");
 
         Ok(())
     }

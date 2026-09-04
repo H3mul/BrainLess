@@ -1,8 +1,7 @@
-use crate::core::{Metric, MetricSample, TickOutputLedger};
 use crate::dag::DagGraphTraversal;
 use crate::engine::buffer_store::BufferStore;
-use crate::{DagGraph, ExecutionMode, MetricEngine};
-use std::any::TypeId;
+use crate::{DagGraph, ExecutionMode, Metric, MetricEngine, MetricId, MetricSample};
+
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -17,10 +16,10 @@ pub struct LiveSessionConfig {
     /// Interval at which to flush buffers to storage, in milliseconds.
     pub flush_interval_ms: i64,
     /// Set of source metrics the session expects to receive externally.
-    pub source_metrics: HashSet<TypeId>,
+    pub source_metrics: HashSet<MetricId>,
     /// Set of output metrics the session is expected to produce
     /// (Optional, if absent defaults to entire metric set)
-    pub output_metrics: Option<HashSet<TypeId>>,
+    pub output_metrics: Option<HashSet<MetricId>>,
 }
 
 /// Replay configuration contains only replay-specific settings.
@@ -28,7 +27,7 @@ pub struct ReplaySessionConfig {
     pub start_time_ms: i64,
     pub end_time_ms: i64,
     pub chunk_size_minutes: u64,
-    pub write_whitelist: Vec<TypeId>,
+    pub write_whitelist: Vec<MetricId>,
 }
 
 #[allow(dead_code)]
@@ -46,7 +45,7 @@ impl LiveSession {
         let output_metrics = config
             .output_metrics
             .clone()
-            .unwrap_or_else(|| engine.metrics.iter().map(|m| m.metric_type).collect());
+            .unwrap_or_else(|| engine.metrics.iter().map(|m| m.metric_id).collect());
 
         let dependency_traversal = graph
             .traverse(
@@ -82,7 +81,7 @@ impl LiveSession {
     }
     pub fn push_metric<T: Metric>(&mut self, timestamp_ms: i64, data: T) {
         self.storage
-            .commit_sample(MetricSample { timestamp_ms, data });
+            .push_sample(MetricSample { timestamp_ms, data });
     }
     pub fn tick(&mut self) -> Result<TickOutputLedger, String> {
         let now_ms = SystemTime::now()

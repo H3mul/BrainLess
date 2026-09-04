@@ -1,5 +1,5 @@
 use super::*;
-use crate::core::Metric;
+use crate::core::{Metric, MetricId};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -21,7 +21,7 @@ impl Metric for OtherSourceMetric {}
 
 struct MockEvaluator {
     name: &'static str,
-    output: TypeId,
+    output: MetricId,
     dependencies: HashSet<MetricDependency>,
 }
 
@@ -30,7 +30,7 @@ impl ErasedEvaluator for MockEvaluator {
         self.name
     }
 
-    fn produces(&self) -> HashSet<TypeId> {
+    fn produces(&self) -> HashSet<MetricId> {
         HashSet::from([self.output])
     }
 
@@ -50,7 +50,7 @@ impl ErasedEvaluator for MockEvaluator {
 
 fn evaluator(
     name: &'static str,
-    output: TypeId,
+    output: MetricId,
     dependencies: impl IntoIterator<Item = MetricDependency>,
 ) -> Arc<dyn ErasedEvaluator> {
     Arc::new(MockEvaluator {
@@ -67,15 +67,15 @@ fn graph(evaluators: impl IntoIterator<Item = Arc<dyn ErasedEvaluator>>) -> DagG
 #[test]
 fn builds_independent_evaluators_into_one_stage() {
     let dag = graph([
-        evaluator("source_a", TypeId::of::<SourceMetric>(), []),
-        evaluator("source_b", TypeId::of::<OtherSourceMetric>(), []),
+        evaluator("source_a", MetricId::of::<SourceMetric>(), []),
+        evaluator("source_b", MetricId::of::<OtherSourceMetric>(), []),
     ]);
     let plan = dag
         .traverse(
             &HashSet::new(),
             &HashSet::from([
-                TypeId::of::<SourceMetric>(),
-                TypeId::of::<OtherSourceMetric>(),
+                MetricId::of::<SourceMetric>(),
+                MetricId::of::<OtherSourceMetric>(),
             ]),
             ExecutionMode::Sequential,
         )
@@ -89,22 +89,22 @@ fn builds_independent_evaluators_into_one_stage() {
 #[test]
 fn orders_consumers_after_all_local_producers() {
     let dag = graph([
-        evaluator("source", TypeId::of::<SourceMetric>(), []),
+        evaluator("source", MetricId::of::<SourceMetric>(), []),
         evaluator(
             "intermediate",
-            TypeId::of::<IntermediateMetric>(),
+            MetricId::of::<IntermediateMetric>(),
             [MetricDependency::latest::<SourceMetric>()],
         ),
         evaluator(
             "target",
-            TypeId::of::<TargetMetric>(),
+            MetricId::of::<TargetMetric>(),
             [MetricDependency::latest::<IntermediateMetric>()],
         ),
     ]);
     let plan = dag
         .traverse(
             &HashSet::new(),
-            &HashSet::from([TypeId::of::<TargetMetric>()]),
+            &HashSet::from([MetricId::of::<TargetMetric>()]),
             ExecutionMode::Sequential,
         )
         .unwrap()
@@ -119,17 +119,17 @@ fn orders_consumers_after_all_local_producers() {
 #[test]
 fn source_metrics_stop_backwards_producer_selection() {
     let dag = graph([
-        evaluator("source_producer", TypeId::of::<SourceMetric>(), []),
+        evaluator("source_producer", MetricId::of::<SourceMetric>(), []),
         evaluator(
             "target",
-            TypeId::of::<TargetMetric>(),
+            MetricId::of::<TargetMetric>(),
             [MetricDependency::latest::<SourceMetric>()],
         ),
     ]);
     let plan = dag
         .traverse(
-            &HashSet::from([TypeId::of::<SourceMetric>()]),
-            &HashSet::from([TypeId::of::<TargetMetric>()]),
+            &HashSet::from([MetricId::of::<SourceMetric>()]),
+            &HashSet::from([MetricId::of::<TargetMetric>()]),
             ExecutionMode::Sequential,
         )
         .unwrap()
@@ -142,24 +142,24 @@ fn source_metrics_stop_backwards_producer_selection() {
 #[test]
 fn traversal_can_be_repeated_with_different_sources() {
     let dag = graph([
-        evaluator("source", TypeId::of::<SourceMetric>(), []),
+        evaluator("source", MetricId::of::<SourceMetric>(), []),
         evaluator(
             "target",
-            TypeId::of::<TargetMetric>(),
+            MetricId::of::<TargetMetric>(),
             [MetricDependency::latest::<SourceMetric>()],
         ),
     ]);
     let without_source = dag
         .traverse(
             &HashSet::new(),
-            &HashSet::from([TypeId::of::<TargetMetric>()]),
+            &HashSet::from([MetricId::of::<TargetMetric>()]),
             ExecutionMode::Sequential,
         )
         .unwrap();
     let with_source = dag
         .traverse(
-            &HashSet::from([TypeId::of::<SourceMetric>()]),
-            &HashSet::from([TypeId::of::<TargetMetric>()]),
+            &HashSet::from([MetricId::of::<SourceMetric>()]),
+            &HashSet::from([MetricId::of::<TargetMetric>()]),
             ExecutionMode::Sequential,
         )
         .unwrap();
@@ -173,13 +173,13 @@ fn traversal_can_be_repeated_with_different_sources() {
 fn rejects_unresolved_dependencies() {
     let dag = graph([evaluator(
         "target",
-        TypeId::of::<TargetMetric>(),
+        MetricId::of::<TargetMetric>(),
         [MetricDependency::latest::<SourceMetric>()],
     )]);
     let error = dag
         .traverse(
             &HashSet::new(),
-            &HashSet::from([TypeId::of::<TargetMetric>()]),
+            &HashSet::from([MetricId::of::<TargetMetric>()]),
             ExecutionMode::Sequential,
         )
         .err()
@@ -191,8 +191,8 @@ fn rejects_unresolved_dependencies() {
 #[test]
 fn rejects_duplicate_metric_producers() {
     let result = DagGraph::new(vec![
-        evaluator("first", TypeId::of::<TargetMetric>(), []),
-        evaluator("second", TypeId::of::<TargetMetric>(), []),
+        evaluator("first", MetricId::of::<TargetMetric>(), []),
+        evaluator("second", MetricId::of::<TargetMetric>(), []),
     ]);
 
     assert!(result.is_err());
@@ -203,19 +203,19 @@ fn rejects_cycles_during_traversal() {
     let dag = graph([
         evaluator(
             "a",
-            TypeId::of::<SourceMetric>(),
+            MetricId::of::<SourceMetric>(),
             [MetricDependency::latest::<IntermediateMetric>()],
         ),
         evaluator(
             "b",
-            TypeId::of::<IntermediateMetric>(),
+            MetricId::of::<IntermediateMetric>(),
             [MetricDependency::latest::<SourceMetric>()],
         ),
     ]);
     let error = dag
         .traverse(
             &HashSet::new(),
-            &HashSet::from([TypeId::of::<SourceMetric>()]),
+            &HashSet::from([MetricId::of::<SourceMetric>()]),
             ExecutionMode::Sequential,
         )
         .err()

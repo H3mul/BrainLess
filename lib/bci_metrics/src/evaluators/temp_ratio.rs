@@ -7,7 +7,7 @@ pub struct TempRatioEvaluator;
 
 impl MetricEvaluator for TempRatioEvaluator {
     type Output = TempRatioMetric;
-    fn id(&self) -> &'static str {
+    fn id() -> &'static str {
         "temp_ratio_evaluator"
     }
     fn dependencies(&self) -> HashSet<MetricDependency> {
