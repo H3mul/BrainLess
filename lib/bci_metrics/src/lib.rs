@@ -2,7 +2,6 @@ pub mod evaluators;
 pub mod metrics;
 
 pub use evaluators::*;
-pub use metric_engine::DuckDbStorageBackend;
 use metric_engine::{MetricEngine, MetricRegistration, boxed_evaluator};
 pub use metrics::*;
 
@@ -18,8 +17,8 @@ pub fn build_eeg_engine() -> Result<MetricEngine, String> {
         ]))
         .with_evaluators(HashSet::from([
             boxed_evaluator(FaaEvaluator),
-            boxed_evaluator(FaaVolatilityEvaluator),
-            boxed_evaluator(TempRatioEvaluator),
+            // boxed_evaluator(FaaVolatilityEvaluator),
+            // boxed_evaluator(TempRatioEvaluator),
         ]))
         .build()
 }

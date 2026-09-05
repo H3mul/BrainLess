@@ -2,6 +2,7 @@ use std::any::TypeId;
 use std::collections::HashSet;
 use std::fmt::Debug;
 
+use crate::BufferStore;
 use crate::engine::buffer_store::ReadOnlyBufferStore;
 
 /// Base trait implemented by every value that flows through the metric engine.
@@ -156,11 +157,7 @@ pub trait MetricGroup: Send + Sync + 'static {
     /// Returns the concrete metric types contained in this output.
     fn type_ids() -> HashSet<MetricId>;
 
-    fn commit_to_bufferstore(
-        self,
-        storage: &mut crate::engine::buffer_store::BufferStore,
-        timestamp_ms: i64,
-    );
+    fn commit_to_store(self, timestamp_ms: i64, storage: &mut BufferStore);
 }
 
 impl<T: Metric> MetricGroup for T {
@@ -168,12 +165,8 @@ impl<T: Metric> MetricGroup for T {
         HashSet::from([MetricId::of::<T>()])
     }
 
-    fn commit_to_bufferstore(
-        self,
-        storage: &mut crate::engine::buffer_store::BufferStore,
-        timestamp_ms: i64,
-    ) {
-        storage.push_sample(MetricSample {
+    fn commit_to_store(self, timestamp_ms: i64, store: &mut BufferStore) {
+        store.push_sample(MetricSample {
             timestamp_ms,
             data: self,
         });
@@ -185,17 +178,13 @@ impl<A: Metric, B: Metric> MetricGroup for (A, B) {
         HashSet::from([MetricId::of::<A>(), MetricId::of::<B>()])
     }
 
-    fn commit_to_bufferstore(
-        self,
-        storage: &mut crate::engine::buffer_store::BufferStore,
-        timestamp_ms: i64,
-    ) {
-        storage.push_sample(MetricSample {
+    fn commit_to_store(self, timestamp_ms: i64, store: &mut BufferStore) {
+        store.push_sample(MetricSample {
             timestamp_ms,
             data: self.0,
         });
 
-        storage.push_sample(MetricSample {
+        store.push_sample(MetricSample {
             timestamp_ms,
             data: self.1,
         });

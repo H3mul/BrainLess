@@ -1,65 +1,15 @@
-use crate::engine::core::{MetricDependency, MetricId};
-use crate::{MetricEvaluator, MetricGroup};
+use crate::engine::buffer_store::ReadOnlyBufferStore;
+use crate::engine::core::MetricId;
+use crate::execution::{ErasedEvaluator, ExecutionPlan, ExecutionStage};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-
-/// Object-safe evaluator interface used by the compiled execution plan.
-pub trait ErasedEvaluator: Send + Sync {
-    /// Stable evaluator identifier.
-    fn id(&self) -> &'static str;
-    /// Concrete metric types produced by the evaluator.
-    fn produces(&self) -> HashSet<MetricId>;
-    /// Dependencies required by the evaluator.
-    fn dependencies(&self) -> HashSet<MetricDependency>;
-}
-
-impl<E> ErasedEvaluator for E
-where
-    E: MetricEvaluator + 'static,
-    E::Output: MetricGroup,
-{
-    fn id(&self) -> &'static str {
-        <E as MetricEvaluator>::id()
-    }
-    fn produces(&self) -> HashSet<MetricId> {
-        E::Output::type_ids()
-    }
-    fn dependencies(&self) -> HashSet<MetricDependency> {
-        <E as MetricEvaluator>::dependencies(self)
-    }
-}
-
-/// Execution strategy for a compiled evaluator plan.
-pub enum ExecutionMode {
-    Sequential,
-    Parallel,
-}
-
-/// A collection of evaluators with no dependencies between one another.
-pub struct ExecutionStage {
-    pub evaluators: Vec<Arc<dyn ErasedEvaluator>>,
-}
-
-/// Dependency-ordered evaluator stages for one engine tick.
-pub struct ExecutionPlan {
-    pub stages: Vec<ExecutionStage>,
-    pub mode: ExecutionMode,
-}
-
-pub struct DagGraphTraversal {
-    // Stages of parallel execution of Evaluators.
-    pub execution_plan: ExecutionPlan,
-
-    // Aggregate set of all dependencies declarations from required evaluators for this traversal.
-    pub aggregate_demand: HashSet<MetricDependency>,
-}
 
 /// Immutable evaluator dependency graph.
 ///
 /// The graph can be queried repeatedly with different source and target
 /// availability sets without rebuilding evaluator relationships.
-pub struct DagGraph {
+pub struct DependencyGraph {
     // Full set of available evaluators (and evaluator index ground truth)
     evaluators: Vec<Arc<dyn ErasedEvaluator>>,
 
@@ -69,7 +19,7 @@ pub struct DagGraph {
     edges: Vec<Vec<usize>>,
 }
 
-impl DagGraph {
+impl DependencyGraph {
     /// Builds the local producer-consumer graph
     ///
     /// Graph nodes are evaluators. An edge connects a producer to a consumer
@@ -111,12 +61,14 @@ impl DagGraph {
     /// metrics do not create edges because they are supplied outside the DAG.
     /// The same mutable in-degree state is used to form each independent stage
     /// and advance the traversal to the next dependency layer.
-    pub fn traverse(
+    ///
+    /// The graph is reusable: evaluators are shared via `Arc` clones, so
+    /// multiple plans can be built from the same graph.
+    pub fn build_execution_plan(
         &self,
         source_metrics: &HashSet<MetricId>,
         target_metrics: &HashSet<MetricId>,
-        mode: ExecutionMode,
-    ) -> Result<DagGraphTraversal, String> {
+    ) -> Result<ExecutionPlan, String> {
         // Set of evaluator indexes that are required to produce the requested target metrics
         let mut required_producers = HashSet::new();
 
@@ -147,18 +99,15 @@ impl DagGraph {
         }
 
         // Collect all dependency declarations of required producers
-        let aggregate_demand = required_producers
-            .iter()
-            .map(|&index| self.evaluators[index].dependencies())
-            .flatten()
-            .collect::<HashSet<_>>();
+        // let aggregate_demand = required_producers
+        //     .iter()
+        //     .map(|&index| self.evaluators[index].dependencies())
+        //     .flatten()
+        //     .collect::<HashSet<_>>();
 
         let stages = self.build_stages(&required_producers)?;
 
-        Ok(DagGraphTraversal {
-            execution_plan: ExecutionPlan { stages, mode },
-            aggregate_demand,
-        })
+        Ok(ExecutionPlan { stages })
     }
 
     /// Given a set of required evaluators, divide them into stages of independent
@@ -222,6 +171,28 @@ impl DagGraph {
         }
         Ok(stages)
     }
+}
+
+/// Filters out evaluators that produce metrics already present in the store
+/// for this timestamp - we don't need to re-compute them.
+///
+/// A metric counts as present when its buffer holds a sample within the
+/// metric's sample-rate tolerance of `timestamp_ms`. Evaluators producing at
+/// least one missing metric are kept whole; stage ordering is preserved.
+pub fn optimize_execution_plan_by_metric_existence(
+    plan: &mut ExecutionPlan,
+    timestamp_ms: i64,
+    store: &ReadOnlyBufferStore,
+) {
+    for stage in plan.stages.iter_mut() {
+        stage.evaluators.retain(|evaluator| {
+            !evaluator
+                .produces()
+                .iter()
+                .all(|metric_id| store.has_value_at(*metric_id, timestamp_ms))
+        });
+    }
+    plan.stages.retain(|stage| !stage.evaluators.is_empty());
 }
 
 #[cfg(test)]

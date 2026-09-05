@@ -9,7 +9,11 @@ pub struct RawEegMetric {
     pub tp10: f32,
 }
 
-impl Metric for RawEegMetric {}
+impl Metric for RawEegMetric {
+    fn id() -> &'static str {
+        "raw_eeg"
+    }
+}
 
 /// DuckDB schema and row conversion for raw EEG samples.
 impl PersistentMetric for RawEegMetric {

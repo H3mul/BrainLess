@@ -10,9 +10,9 @@ use tracing::{info, warn};
 use self::core::{Metric, MetricDependency, MetricEvaluator, MetricGroup, MetricId};
 use self::sessions::{LiveSession, LiveSessionConfig};
 
-use crate::dag::ErasedEvaluator;
 use crate::db::persistence::PersistentMetric;
 use crate::engine::buffer_store::BufferStore;
+use crate::execution::ErasedEvaluator;
 
 /// Erased buffer registration for a metric type. A plain function pointer: the
 /// constructors never capture state, so every registration is guaranteed to

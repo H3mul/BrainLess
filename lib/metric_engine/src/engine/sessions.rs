@@ -1,6 +1,7 @@
-use crate::dag::DagGraphTraversal;
-use crate::engine::buffer_store::BufferStore;
-use crate::{DagGraph, ExecutionMode, Metric, MetricEngine, MetricId, MetricSample};
+use crate::engine::buffer_store::{BufferStore, MetricSnapshot};
+use crate::execution::dependency_graph::DependencyGraph;
+use crate::execution::tick_executor::TickExecutor;
+use crate::{Metric, MetricEngine, MetricId, MetricSample};
 
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,24 +23,25 @@ pub struct LiveSessionConfig {
     pub output_metrics: Option<HashSet<MetricId>>,
 }
 
-/// Replay configuration contains only replay-specific settings.
-pub struct ReplaySessionConfig {
-    pub start_time_ms: i64,
-    pub end_time_ms: i64,
-    pub chunk_size_minutes: u64,
-    pub write_whitelist: Vec<MetricId>,
-}
+// Replay configuration contains only replay-specific settings.
+// pub struct ReplaySessionConfig {
+//     pub start_time_ms: i64,
+//     pub end_time_ms: i64,
+//     pub chunk_size_minutes: u64,
+//     pub write_whitelist: Vec<MetricId>,
+// }
 
 #[allow(dead_code)]
 pub struct LiveSession {
     config: LiveSessionConfig,
-    storage: BufferStore,
-    dependency_traversal: DagGraphTraversal,
+    store: BufferStore,
+    executor: TickExecutor,
 }
 
 impl LiveSession {
     pub(crate) fn new(config: LiveSessionConfig, engine: &MetricEngine) -> Self {
-        let graph = DagGraph::new(engine.evaluators.clone()).expect("failed to compile metric dag");
+        let dep_graph = DependencyGraph::new(engine.evaluators.clone())
+            .expect("failed to build dependency graph");
 
         // If output_metrics is not specified, default to all metrics in the engine.
         let output_metrics = config
@@ -47,72 +49,67 @@ impl LiveSession {
             .clone()
             .unwrap_or_else(|| engine.metrics.iter().map(|m| m.metric_id).collect());
 
-        let dependency_traversal = graph
-            .traverse(
-                &config.source_metrics,
-                &output_metrics,
-                ExecutionMode::Sequential,
-            )
-            .expect("failed to traverse metric dag");
-
-        let mut storage = BufferStore::new();
-
-        for metric in &engine.metrics {
-            (metric.register)(
-                &mut storage,
-                config.buffer_size_ms,
-                &dependency_traversal.aggregate_demand,
-            )
-            .expect("failed to register metric buffer");
-        }
+        let plan = dep_graph
+            .build_execution_plan(&config.source_metrics, &output_metrics)
+            .expect("failed to build execution plan");
 
         Self {
             config,
-            storage,
-            dependency_traversal,
+            store: BufferStore::new(),
+            executor: TickExecutor::new(plan),
         }
     }
+
+    /// Add a metric to the store at the current timestamp.
     pub fn push_live_metric<T: Metric>(&mut self, data: T) {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock before epoch")
-            .as_millis() as i64;
-        self.push_metric(now_ms, data);
-    }
-    pub fn push_metric<T: Metric>(&mut self, timestamp_ms: i64, data: T) {
-        self.storage
-            .push_sample(MetricSample { timestamp_ms, data });
-    }
-    pub fn tick(&mut self) -> Result<TickOutputLedger, String> {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| error.to_string())?
-            .as_millis() as i64;
-        self.tick_at(now_ms)
+        self.push_metric(current_timestamp(), data);
     }
 
-    pub fn feed_live_metric<T: Metric>(&mut self, data: T) -> Result<TickOutputLedger, String> {
+    /// Add a metric to the store at the given timestamp.
+    pub fn push_metric<T: Metric>(&mut self, timestamp_ms: i64, data: T) {
+        self.store.push_sample(MetricSample { timestamp_ms, data });
+    }
+
+    /// Add a metric to the store at the current timestamp and tick the executor immediately.
+    pub fn feed_live_metric<T: Metric>(&mut self, data: T) {
         self.push_live_metric(data);
         self.tick()
     }
 
-    pub fn feed_live_metric_batch<T: Metric>(
-        &mut self,
-        batch: Vec<T>,
-    ) -> Result<TickOutputLedger, String> {
+    /// Add a batch of metrics to the store at the current timestamp and tick the executor immediately.
+    pub fn feed_live_metric_batch<T: Metric>(&mut self, batch: Vec<T>) {
         for metric in batch {
             self.push_live_metric(metric);
         }
         self.tick()
     }
-    fn tick_at(&mut self, timestamp_ms: i64) -> Result<TickOutputLedger, String> {
-        self.dependency_traversal
-            .execution_plan
-            .execute(&mut self.storage, timestamp_ms)?;
-        Ok(TickOutputLedger::new(
-            self.storage.provision_output_ledger(timestamp_ms),
-        ))
+
+    /// Tick the executor at the current timestamp.
+    pub fn tick(&mut self) {
+        self.tick_at(current_timestamp())
     }
+
+    /// Tick the executor at the given timestamp.
+    fn tick_at(&mut self, timestamp_ms: i64) {
+        self.executor.tick(timestamp_ms, &mut self.store);
+    }
+
+    /// Returns a point-in-time immutable snapshot for the session's latest evaluated timestamp.
+    pub fn get_metric_snapshot(&self) -> MetricSnapshot {
+        self.get_metric_snapshot_at(current_timestamp())
+    }
+
+    /// Returns a point-in-time immutable snapshot captured at a specific timestamp.
+    pub fn get_metric_snapshot_at(&self, timestamp_ms: i64) -> MetricSnapshot {
+        MetricSnapshot::from_store(timestamp_ms, &self.store)
+    }
+}
+
+pub fn current_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Failed to get current timestamp")
+        .as_millis() as i64
 }
 
 // pub struct ReplaySession {

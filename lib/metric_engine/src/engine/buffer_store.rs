@@ -115,7 +115,7 @@ impl<T: Metric> TimeSeriesBuffer<T> {
 /// Type-erased operations over a [`TimeSeriesBuffer`], used by
 /// [`BufferStore`] and [`TickLedger`] to interact with buffers of any metric
 /// type without knowing `T`.
-pub(crate) trait ErasedTimeSeriesBuffer: Send + Sync {
+pub trait ErasedTimeSeriesBuffer: Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
 
@@ -123,6 +123,12 @@ pub(crate) trait ErasedTimeSeriesBuffer: Send + Sync {
 
     /// `(timestamp, debug-formatted value)` pairs for every retained sample.
     fn debug_rows(&self) -> Vec<(i64, String)>;
+
+    /// Whether a sample exists within the metric's sample-rate tolerance of
+    /// `timestamp_ms`.
+    fn has_value_at(&self, timestamp_ms: i64) -> bool;
+
+    fn clone_erased(&self) -> Box<dyn ErasedTimeSeriesBuffer>;
 }
 
 impl<T: Metric> ErasedTimeSeriesBuffer for TimeSeriesBuffer<T> {
@@ -146,6 +152,14 @@ impl<T: Metric> ErasedTimeSeriesBuffer for TimeSeriesBuffer<T> {
             .map(|sample| (sample.timestamp_ms, format!("{:?}", sample.data)))
             .collect()
     }
+
+    fn has_value_at(&self, timestamp_ms: i64) -> bool {
+        self.get_sample_for_ts(timestamp_ms).is_some()
+    }
+
+    fn clone_erased(&self) -> Box<dyn ErasedTimeSeriesBuffer> {
+        Box::new(self.clone())
+    }
 }
 
 /// A read-only immutable view of the buffer store to pass to Evaluators and out
@@ -163,6 +177,16 @@ impl<'a> ReadOnlyBufferStore<'a> {
     #[inline]
     pub fn get_buffer<T: Metric>(&self) -> Option<&'a TimeSeriesBuffer<T>> {
         self.store.get_buffer::<T>()
+    }
+
+    /// Whether the buffer for `metric_id` holds a sample within the metric's
+    /// sample-rate tolerance of `timestamp_ms`.
+    #[inline]
+    pub fn has_value_at(&self, metric_id: MetricId, timestamp_ms: i64) -> bool {
+        self.store
+            .buffers
+            .get(&metric_id)
+            .is_some_and(|buffer| buffer.has_value_at(timestamp_ms))
     }
 }
 
@@ -243,5 +267,47 @@ impl BufferStore {
                 "discarding sample because no metric buffer is registered"
             ),
         }
+    }
+
+    pub fn buffers_iter(
+        &self,
+    ) -> impl Iterator<Item = (&MetricId, &Box<dyn ErasedTimeSeriesBuffer>)> {
+        self.buffers.iter()
+    }
+}
+
+pub struct MetricSnapshot {
+    pub timestamp_ms: i64,
+    // Storage maps MetricId to an Arc reference of the vector slice
+    buffers: HashMap<MetricId, Box<dyn ErasedTimeSeriesBuffer>>,
+}
+
+// Guaranteed safe to pass across threads (e.g., to async UI or storage tasks)
+unsafe impl Send for MetricSnapshot {}
+unsafe impl Sync for MetricSnapshot {}
+
+impl MetricSnapshot {
+    /// Constructs an immutable, borrow-free snapshot of the current BufferStore state.
+    pub fn from_store(timestamp_ms: i64, store: &BufferStore) -> Self {
+        let mut buffers = HashMap::default();
+
+        for (&metric_id, buffer) in store.buffers_iter() {
+            buffers.insert(metric_id, buffer.clone_erased());
+        }
+
+        Self {
+            timestamp_ms,
+            buffers,
+        }
+    }
+
+    /// Read-only buffer accessor for downstream consumers.
+    #[inline]
+    pub fn get_buffer<T: Metric>(&self) -> Option<&TimeSeriesBuffer<T>> {
+        let metric_id = MetricId::of::<T>();
+        self.buffers
+            .get(&metric_id)?
+            .as_any()
+            .downcast_ref::<TimeSeriesBuffer<T>>()
     }
 }

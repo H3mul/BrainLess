@@ -5,4 +5,8 @@ use metric_engine::Metric;
 pub struct TempRatioMetric {
     pub ratio: f32,
 }
-impl Metric for TempRatioMetric {}
+impl Metric for TempRatioMetric {
+    fn id() -> &'static str {
+        "temp_ratio"
+    }
+}

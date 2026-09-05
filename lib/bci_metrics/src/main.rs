@@ -17,15 +17,15 @@ fn main() -> Result<(), String> {
         af7: 8.5,
         af8: 5.1,
         tp10: 9.2,
-    })?;
+    });
 
-    let ledger = live.feed_live_metric(RawEegMetric {
+    live.feed_live_metric(RawEegMetric {
         tp9: 12.0,
         af7: 10.5,
         af8: 5.1,
         tp10: 11.2,
-    })?;
+    });
 
-    println!("Metric ledger:\n{}", ledger.pretty_print());
+    // println!("Metric ledger:\n{}", live.get_metric_snapshot());
     Ok(())
 }

@@ -1,4 +1,4 @@
-use crate::{SampleRate, StorageBackend};
+use crate::{SampleRate, db::backend::StorageBackend};
 use tracing::{debug, info};
 
 /// DuckDB adapter boundary. A production application can replace the simple

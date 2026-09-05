@@ -180,50 +180,50 @@ impl PersistenceDriver {
         Ok(())
     }
 
-    /// Flushes new persistent samples to the backend when the configured
-    /// interval has elapsed.
-    pub fn flush(
-        &mut self,
-        store: &mut BufferStore,
-        timestamp_ms: i64,
-        backend: &mut dyn StorageBackend,
-    ) -> Result<(), String> {
-        if timestamp_ms - self.last_flush_timestamp_ms < self.flush_interval_ms {
-            return Ok(());
-        }
+    // Flushes new persistent samples to the backend when the configured
+    // interval has elapsed.
+    // pub fn flush(
+    //     &mut self,
+    //     store: &mut BufferStore,
+    //     timestamp_ms: i64,
+    //     backend: &mut dyn StorageBackend,
+    // ) -> Result<(), String> {
+    //     if timestamp_ms - self.last_flush_timestamp_ms < self.flush_interval_ms {
+    //         return Ok(());
+    //     }
 
-        info!(
-            timestamp_ms,
-            previous_flush_timestamp_ms = self.last_flush_timestamp_ms,
-            codec_count = self.codecs.len(),
-            "flushing metric buffers to persistent storage"
-        );
-        let mut flushed_buffer_count = 0;
-        for (metric_id, codec) in &self.codecs {
-            let watermark = *self.flush_watermarks.get(metric_id).unwrap_or(&0);
-            let samples = store.samples_since(*metric_id, watermark);
-            if samples.is_empty() {
-                continue;
-            }
-            flushed_buffer_count += 1;
+    //     info!(
+    //         timestamp_ms,
+    //         previous_flush_timestamp_ms = self.last_flush_timestamp_ms,
+    //         codec_count = self.codecs.len(),
+    //         "flushing metric buffers to persistent storage"
+    //     );
+    //     let mut flushed_buffer_count = 0;
+    //     for (metric_id, codec) in &self.codecs {
+    //         let watermark = *self.flush_watermarks.get(metric_id).unwrap_or(&0);
+    //         let samples = store.samples_since(*metric_id, watermark);
+    //         if samples.is_empty() {
+    //             continue;
+    //         }
+    //         flushed_buffer_count += 1;
 
-            let rows: Vec<Vec<String>> = samples
-                .iter()
-                .filter_map(|(timestamp, data)| (codec.encode_row)(*timestamp, data.as_ref()))
-                .collect();
-            let high_watermark = samples
-                .iter()
-                .map(|(timestamp, _)| *timestamp)
-                .max()
-                .unwrap_or(watermark);
+    //         let rows: Vec<Vec<String>> = samples
+    //             .iter()
+    //             .filter_map(|(timestamp, data)| (codec.encode_row)(*timestamp, data.as_ref()))
+    //             .collect();
+    //         let high_watermark = samples
+    //             .iter()
+    //             .map(|(timestamp, _)| *timestamp)
+    //             .max()
+    //             .unwrap_or(watermark);
 
-            backend.flush_batch(codec.table, codec.columns, &rows)?;
-            self.flush_watermarks.insert(*metric_id, high_watermark);
-        }
+    //         backend.flush_batch(codec.table, codec.columns, &rows)?;
+    //         self.flush_watermarks.insert(*metric_id, high_watermark);
+    //     }
 
-        self.last_flush_timestamp_ms = timestamp_ms;
-        info!(flushed_buffer_count, "metric storage flush completed");
+    //     self.last_flush_timestamp_ms = timestamp_ms;
+    //     info!(flushed_buffer_count, "metric storage flush completed");
 
-        Ok(())
-    }
+    //     Ok(())
+    // }
 }

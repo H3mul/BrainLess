@@ -5,7 +5,11 @@ use metric_engine::{Metric, PersistentMetric};
 pub struct FaaVolatilityMetric {
     pub volatility: f32,
 }
-impl Metric for FaaVolatilityMetric {}
+impl Metric for FaaVolatilityMetric {
+    fn id() -> &'static str {
+        "faa_volatility"
+    }
+}
 
 /// DuckDB schema and row conversion for FAA volatility.
 impl PersistentMetric for FaaVolatilityMetric {
