@@ -1,5 +1,5 @@
 use crate::engine::buffer_store::ReadOnlyBufferStore;
-use crate::engine::core::MetricId;
+use crate::engine::core::{MetricDependency, MetricId};
 use crate::execution::{ErasedEvaluator, ExecutionPlan, ExecutionStage};
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -98,16 +98,27 @@ impl DependencyGraph {
             }
         }
 
-        // Collect all dependency declarations of required producers
-        // let aggregate_demand = required_producers
-        //     .iter()
-        //     .map(|&index| self.evaluators[index].dependencies())
-        //     .flatten()
-        //     .collect::<HashSet<_>>();
-
         let stages = self.build_stages(&required_producers)?;
 
-        Ok(ExecutionPlan { stages })
+        // Aggregate dependency declarations across required producers, used
+        // for buffer sizing.
+        let aggregate_demand: HashSet<MetricDependency> = required_producers
+            .iter()
+            .flat_map(|&index| self.evaluators[index].dependencies())
+            .collect();
+
+        // Every metric the plan touches: externally fed sources plus all
+        // metrics produced by the planned evaluators.
+        let mut plan_metrics = source_metrics.clone();
+        for &index in &required_producers {
+            plan_metrics.extend(self.evaluators[index].produces());
+        }
+
+        Ok(ExecutionPlan {
+            stages,
+            plan_metrics,
+            aggregate_demand,
+        })
     }
 
     /// Given a set of required evaluators, divide them into stages of independent

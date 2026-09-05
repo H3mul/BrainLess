@@ -2,16 +2,24 @@ use crate::engine::core::requested_history_ms;
 use crate::{Metric, MetricDependency, MetricId, MetricSample};
 use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use tracing::debug;
 
 /// Bounded time-ordered buffer of metric samples for one metric type.
 ///
 /// Samples are kept sorted and deduplicated by timestamp. The buffer does not
-/// enforce a retention window on its own; use [`TimeSeriesBuffer::evict_before`]
-/// (or [`BufferStore::evict_before`]) to drop stale samples.
+/// enforce a retention window on its own; use
+/// [`TimeSeriesBuffer::evict_samples_before_ts`] (or [`BufferStore::evict_before`])
+/// to drop stale samples.
 #[derive(Debug, Clone)]
 pub struct TimeSeriesBuffer<T: Metric> {
     pub samples: VecDeque<MetricSample<T>>,
+}
+
+impl<T: Metric> Default for TimeSeriesBuffer<T> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<T: Metric> TimeSeriesBuffer<T> {
@@ -80,16 +88,6 @@ impl<T: Metric> TimeSeriesBuffer<T> {
         }
     }
 
-    /// Drops all samples older than the provided age, relative to the newest
-    /// sample in the buffer.
-    fn evict_samples_older_than_ts(&mut self, age_ts: i64) {
-        let Some(newest_timestamp_ms) = self.samples.back().map(|sample| sample.timestamp_ms)
-        else {
-            return;
-        };
-        self.evict_samples_before_ts(newest_timestamp_ms.saturating_sub(age_ts));
-    }
-
     /// Drops all samples older than `timestamp_ms`.
     pub fn evict_samples_before_ts(&mut self, timestamp_ms: i64) {
         while self
@@ -128,6 +126,11 @@ pub trait ErasedTimeSeriesBuffer: Send + Sync {
     /// `timestamp_ms`.
     fn has_value_at(&self, timestamp_ms: i64) -> bool;
 
+    /// Samples with `timestamp_ms > watermark_ts`, cloned and type-erased as
+    /// `(timestamp, value)` pairs. Used by the persistence layer to extract
+    /// unflushed samples without knowing `T`.
+    fn samples_since(&self, watermark_ts: i64) -> Vec<(i64, Arc<dyn Any + Send + Sync>)>;
+
     fn clone_erased(&self) -> Box<dyn ErasedTimeSeriesBuffer>;
 }
 
@@ -155,6 +158,22 @@ impl<T: Metric> ErasedTimeSeriesBuffer for TimeSeriesBuffer<T> {
 
     fn has_value_at(&self, timestamp_ms: i64) -> bool {
         self.get_sample_for_ts(timestamp_ms).is_some()
+    }
+
+    fn samples_since(&self, watermark_ts: i64) -> Vec<(i64, Arc<dyn Any + Send + Sync>)> {
+        let start = self
+            .samples
+            .partition_point(|sample| sample.timestamp_ms <= watermark_ts);
+        self.samples
+            .iter()
+            .skip(start)
+            .map(|sample| {
+                (
+                    sample.timestamp_ms,
+                    Arc::new(sample.data.clone()) as Arc<dyn Any + Send + Sync>,
+                )
+            })
+            .collect()
     }
 
     fn clone_erased(&self) -> Box<dyn ErasedTimeSeriesBuffer> {
@@ -199,6 +218,12 @@ impl<'a> ReadOnlyBufferStore<'a> {
 /// interaction lives in [`crate::db::persistence`].
 pub struct BufferStore {
     buffers: HashMap<MetricId, Box<dyn ErasedTimeSeriesBuffer>>,
+}
+
+impl Default for BufferStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BufferStore {
@@ -273,6 +298,25 @@ impl BufferStore {
         &self,
     ) -> impl Iterator<Item = (&MetricId, &Box<dyn ErasedTimeSeriesBuffer>)> {
         self.buffers.iter()
+    }
+
+    /// Returns the samples newer than `watermark_ts` for a metric, cloned and
+    /// type-erased for the persistence layer. Empty when the metric has no
+    /// registered buffer.
+    pub fn samples_since(
+        &self,
+        metric_id: MetricId,
+        watermark_ts: i64,
+    ) -> Vec<(i64, Arc<dyn Any + Send + Sync>)> {
+        self.buffers
+            .get(&metric_id)
+            .map(|buffer| buffer.samples_since(watermark_ts))
+            .unwrap_or_default()
+    }
+
+    /// Whether a buffer is registered for the metric type.
+    pub fn has_buffer(&self, metric_id: MetricId) -> bool {
+        self.buffers.contains_key(&metric_id)
     }
 }
 

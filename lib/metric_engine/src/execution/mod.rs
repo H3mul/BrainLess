@@ -67,7 +67,14 @@ pub struct ExecutionStage {
     pub evaluators: Vec<Arc<dyn ErasedEvaluator>>,
 }
 
-/// Dependency-ordered evaluator stages for one engine tick.
+/// Dependency-ordered evaluator stages for one engine tick, with the metric
+/// coverage and aggregate dependency demand computed during planning.
 pub struct ExecutionPlan {
     pub stages: Vec<ExecutionStage>,
+    /// Every metric the plan touches: declared source metrics plus all
+    /// metrics produced by the planned evaluators.
+    pub plan_metrics: HashSet<MetricId>,
+    /// Aggregate dependency declarations across all planned evaluators, used
+    /// for buffer sizing.
+    pub aggregate_demand: HashSet<MetricDependency>,
 }

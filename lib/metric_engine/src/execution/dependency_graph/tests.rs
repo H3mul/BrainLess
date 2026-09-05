@@ -1,23 +1,45 @@
 use super::*;
-use crate::core::{Metric, MetricId};
+use crate::execution::StagedOutput;
+use crate::{BufferStore, Metric, MetricDependency, MetricId};
 use std::collections::HashSet;
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 struct SourceMetric;
-impl Metric for SourceMetric {}
+impl Metric for SourceMetric {
+    fn id() -> &'static str {
+        "source_metric"
+    }
+}
 
 #[derive(Clone, Debug)]
 struct IntermediateMetric;
-impl Metric for IntermediateMetric {}
+impl Metric for IntermediateMetric {
+    fn id() -> &'static str {
+        "intermediate_metric"
+    }
+}
 
 #[derive(Clone, Debug)]
 struct TargetMetric;
-impl Metric for TargetMetric {}
+impl Metric for TargetMetric {
+    fn id() -> &'static str {
+        "target_metric"
+    }
+}
 
 #[derive(Clone, Debug)]
 struct OtherSourceMetric;
-impl Metric for OtherSourceMetric {}
+impl Metric for OtherSourceMetric {
+    fn id() -> &'static str {
+        "other_source_metric"
+    }
+}
+
+struct NoopOutput;
+impl StagedOutput for NoopOutput {
+    fn commit_to_store(self: Box<Self>, _timestamp_ms: i64, _store: &mut BufferStore) {}
+}
 
 struct MockEvaluator {
     name: &'static str,
@@ -38,13 +60,12 @@ impl ErasedEvaluator for MockEvaluator {
         self.dependencies.clone()
     }
 
-    fn evaluate_and_commit(
+    fn evaluate_erased(
         &self,
-        _ledger: &TickLedger,
-        _storage: &mut BufferStore,
         _timestamp_ms: i64,
-    ) -> Result<(), String> {
-        Ok(())
+        _store: &ReadOnlyBufferStore,
+    ) -> Result<Box<dyn StagedOutput>, String> {
+        Ok(Box::new(NoopOutput))
     }
 }
 
@@ -60,8 +81,8 @@ fn evaluator(
     })
 }
 
-fn graph(evaluators: impl IntoIterator<Item = Arc<dyn ErasedEvaluator>>) -> DagGraph {
-    DagGraph::new(evaluators.into_iter().collect()).expect("test graph should compile")
+fn graph(evaluators: impl IntoIterator<Item = Arc<dyn ErasedEvaluator>>) -> DependencyGraph {
+    DependencyGraph::new(evaluators.into_iter().collect()).expect("test graph should compile")
 }
 
 #[test]
@@ -71,16 +92,14 @@ fn builds_independent_evaluators_into_one_stage() {
         evaluator("source_b", MetricId::of::<OtherSourceMetric>(), []),
     ]);
     let plan = dag
-        .traverse(
+        .build_execution_plan(
             &HashSet::new(),
             &HashSet::from([
                 MetricId::of::<SourceMetric>(),
                 MetricId::of::<OtherSourceMetric>(),
             ]),
-            ExecutionMode::Sequential,
         )
-        .unwrap()
-        .execution_plan;
+        .unwrap();
 
     assert_eq!(plan.stages.len(), 1);
     assert_eq!(plan.stages[0].evaluators.len(), 2);
@@ -102,13 +121,11 @@ fn orders_consumers_after_all_local_producers() {
         ),
     ]);
     let plan = dag
-        .traverse(
+        .build_execution_plan(
             &HashSet::new(),
             &HashSet::from([MetricId::of::<TargetMetric>()]),
-            ExecutionMode::Sequential,
         )
-        .unwrap()
-        .execution_plan;
+        .unwrap();
 
     assert_eq!(plan.stages.len(), 3);
     assert_eq!(plan.stages[0].evaluators[0].id(), "source");
@@ -127,16 +144,21 @@ fn source_metrics_stop_backwards_producer_selection() {
         ),
     ]);
     let plan = dag
-        .traverse(
+        .build_execution_plan(
             &HashSet::from([MetricId::of::<SourceMetric>()]),
             &HashSet::from([MetricId::of::<TargetMetric>()]),
-            ExecutionMode::Sequential,
         )
-        .unwrap()
-        .execution_plan;
+        .unwrap();
 
     assert_eq!(plan.stages.len(), 1);
     assert_eq!(plan.stages[0].evaluators[0].id(), "target");
+    assert_eq!(
+        plan.plan_metrics,
+        HashSet::from([
+            MetricId::of::<SourceMetric>(),
+            MetricId::of::<TargetMetric>()
+        ])
+    );
 }
 
 #[test]
@@ -150,23 +172,61 @@ fn traversal_can_be_repeated_with_different_sources() {
         ),
     ]);
     let without_source = dag
-        .traverse(
+        .build_execution_plan(
             &HashSet::new(),
             &HashSet::from([MetricId::of::<TargetMetric>()]),
-            ExecutionMode::Sequential,
         )
         .unwrap();
     let with_source = dag
-        .traverse(
+        .build_execution_plan(
             &HashSet::from([MetricId::of::<SourceMetric>()]),
             &HashSet::from([MetricId::of::<TargetMetric>()]),
-            ExecutionMode::Sequential,
         )
         .unwrap();
 
-    assert_eq!(without_source.execution_plan.stages.len(), 2);
-    assert_eq!(with_source.execution_plan.stages.len(), 1);
+    assert_eq!(without_source.stages.len(), 2);
+    assert_eq!(with_source.stages.len(), 1);
+    assert_eq!(without_source.aggregate_demand.len(), 1);
     assert_eq!(with_source.aggregate_demand.len(), 1);
+}
+
+#[test]
+fn plan_collects_metrics_and_aggregate_demand() {
+    let dag = graph([
+        evaluator("source", MetricId::of::<SourceMetric>(), []),
+        evaluator(
+            "intermediate",
+            MetricId::of::<IntermediateMetric>(),
+            [MetricDependency::latest::<SourceMetric>()],
+        ),
+        evaluator(
+            "target",
+            MetricId::of::<TargetMetric>(),
+            [MetricDependency::latest::<IntermediateMetric>()],
+        ),
+    ]);
+    let plan = dag
+        .build_execution_plan(
+            &HashSet::new(),
+            &HashSet::from([MetricId::of::<TargetMetric>()]),
+        )
+        .unwrap();
+
+    assert_eq!(
+        plan.plan_metrics,
+        HashSet::from([
+            MetricId::of::<SourceMetric>(),
+            MetricId::of::<IntermediateMetric>(),
+            MetricId::of::<TargetMetric>(),
+        ])
+    );
+    assert_eq!(
+        plan.aggregate_demand,
+        HashSet::from([
+            MetricDependency::latest::<SourceMetric>(),
+            MetricDependency::latest::<IntermediateMetric>(),
+        ])
+    );
 }
 
 #[test]
@@ -177,10 +237,9 @@ fn rejects_unresolved_dependencies() {
         [MetricDependency::latest::<SourceMetric>()],
     )]);
     let error = dag
-        .traverse(
+        .build_execution_plan(
             &HashSet::new(),
             &HashSet::from([MetricId::of::<TargetMetric>()]),
-            ExecutionMode::Sequential,
         )
         .err()
         .expect("expected error");
@@ -190,7 +249,7 @@ fn rejects_unresolved_dependencies() {
 
 #[test]
 fn rejects_duplicate_metric_producers() {
-    let result = DagGraph::new(vec![
+    let result = DependencyGraph::new(vec![
         evaluator("first", MetricId::of::<TargetMetric>(), []),
         evaluator("second", MetricId::of::<TargetMetric>(), []),
     ]);
@@ -213,10 +272,9 @@ fn rejects_cycles_during_traversal() {
         ),
     ]);
     let error = dag
-        .traverse(
+        .build_execution_plan(
             &HashSet::new(),
             &HashSet::from([MetricId::of::<SourceMetric>()]),
-            ExecutionMode::Sequential,
         )
         .err()
         .expect("expected error");

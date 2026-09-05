@@ -2,8 +2,10 @@ pub mod db;
 pub mod engine;
 pub mod execution;
 
-// pub use db::backend::{NoopStorageBackend, StorageBackend};
-// pub use db::duckdb_impl::DuckDbStorageBackend;
+#[cfg(test)]
+pub(crate) mod test_fixtures;
+
+pub use db::backend::{NoopStorageBackend, StorageBackend};
 pub use db::persistence::{PersistenceDriver, PersistentMetric};
 pub use engine::buffer_store::{BufferStore, TimeSeriesBuffer};
 pub use engine::core::{

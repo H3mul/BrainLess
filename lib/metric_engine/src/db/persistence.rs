@@ -1,12 +1,9 @@
 use crate::db::backend::StorageBackend;
 use crate::engine::buffer_store::BufferStore;
-use crate::engine::core::{
-    Metric, MetricDependency, MetricId, MetricSample, SampleRate, requested_history_ms,
-    requested_sample_rate,
-};
+use crate::engine::core::{Metric, MetricId};
 
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use tracing::{debug, info};
 
 /// Application-provided persistence mapping for a metric type.
@@ -62,12 +59,13 @@ fn encode_sample<T: PersistentMetric>(
     Some(params)
 }
 
-/// Drives persistence for the buffer manager: flushes drained samples to the
-/// backend on a schedule and loads historic samples back into buffers.
+/// Drives persistence for the buffer store: encodes buffered samples into
+/// rows and flushes them to the backend on a schedule.
 ///
-/// The buffer manager stays storage agnostic; this type owns the flush
-/// watermarks, the per-type row codecs, and the backend interaction.
+/// The buffer store stays storage agnostic; this type owns the backend, the
+/// flush watermarks, and the per-type row codecs.
 pub struct PersistenceDriver {
+    backend: Box<dyn StorageBackend>,
     codecs: HashMap<MetricId, SampleCodec>,
     flush_watermarks: HashMap<MetricId, i64>,
     last_flush_timestamp_ms: i64,
@@ -75,9 +73,10 @@ pub struct PersistenceDriver {
 }
 
 impl PersistenceDriver {
-    pub fn new(flush_interval_ms: i64) -> Self {
+    pub fn new(flush_interval_ms: i64, backend: Box<dyn StorageBackend>) -> Self {
         debug!(flush_interval_ms, "initializing persistence driver");
         Self {
+            backend,
             codecs: HashMap::new(),
             flush_watermarks: HashMap::new(),
             last_flush_timestamp_ms: 0,
@@ -89,141 +88,77 @@ impl PersistenceDriver {
         self.flush_interval_ms
     }
 
-    /// Registers a persistent metric: creates its buffer (sized to also
-    /// survive one flush interval), records its row codec, and backfills
-    /// demanded history from the backend.
-    pub fn register_persistent<T: PersistentMetric>(
-        &mut self,
-        store: &mut BufferStore,
-        buffer_size_ms: i64,
-        demand: &HashSet<MetricDependency>,
-        backend: &dyn StorageBackend,
-    ) -> Result<(), String> {
+    /// Records the row codec for a persistent metric type so its buffered
+    /// samples can be encoded and flushed to the backend.
+    pub fn register_codec<T: PersistentMetric>(&mut self) {
         let metric_id = MetricId::of::<T>();
-        let effective_buffer_size_ms = buffer_size_ms.max(self.flush_interval_ms);
-
-        debug!(
-            metric_id = ?metric_id,
-            buffer_size_ms = effective_buffer_size_ms,
-            persistent = true,
-            "registering persistent metric buffer"
-        );
-
-        store.register_buffer::<T>(effective_buffer_size_ms, demand);
+        debug!(metric_id = ?metric_id, "registering persistent metric codec");
         self.codecs.insert(metric_id, SampleCodec::of::<T>());
-        self.flush_watermarks.entry(metric_id).or_insert(0);
+    }
 
-        let requested_history_ms = requested_history_ms(demand, metric_id);
-        if requested_history_ms > 0 {
-            let sample_rate = requested_sample_rate(demand, metric_id);
-            self.load_historic::<T>(store, requested_history_ms, sample_rate, backend)?;
+    /// Flushes new samples to the backend only when the configured interval
+    /// has elapsed since the last flush, measured on the provided timestamp.
+    /// Returns the number of metric buffers flushed.
+    pub fn maybe_flush(
+        &mut self,
+        store: &mut BufferStore,
+        timestamp_ms: i64,
+    ) -> Result<usize, String> {
+        if timestamp_ms.saturating_sub(self.last_flush_timestamp_ms) < self.flush_interval_ms {
+            return Ok(0);
         }
-        Ok(())
+        self.flush(store, timestamp_ms)
     }
 
-    /// Loads and decodes the most recent historic window into the buffer.
-    pub fn load_historic<T: PersistentMetric>(
-        &mut self,
-        store: &mut BufferStore,
-        window_ms: i64,
-        sample_rate: SampleRate,
-        backend: &dyn StorageBackend,
-    ) -> Result<(), String> {
-        debug!(
-            metric_id = ?MetricId::of::<T>(),
-            window_ms,
-            ?sample_rate,
-            "loading historic metric window"
+    /// Flushes every sample newer than its metric's watermark to the backend,
+    /// regardless of the flush interval. Returns the number of metric buffers
+    /// flushed. On backend failure the affected watermarks stay untouched, so
+    /// the samples are retried by the next flush.
+    pub fn flush(&mut self, store: &mut BufferStore, timestamp_ms: i64) -> Result<usize, String> {
+        if self.backend.is_noop() {
+            return Ok(0);
+        }
+
+        info!(
+            timestamp_ms,
+            previous_flush_timestamp_ms = self.last_flush_timestamp_ms,
+            codec_count = self.codecs.len(),
+            "flushing metric buffers to persistent storage"
         );
-        let rows = backend.fetch_historic(T::table_name(), window_ms, sample_rate)?;
-        self.load_rows::<T>(store, rows)
-    }
-
-    /// Loads and decodes a historic range into the buffer.
-    pub fn load_historic_range<T: PersistentMetric>(
-        &mut self,
-        store: &mut BufferStore,
-        start_ms: i64,
-        end_ms: i64,
-        sample_rate: SampleRate,
-        backend: &dyn StorageBackend,
-    ) -> Result<(), String> {
-        debug!(
-            metric_id = ?MetricId::of::<T>(),
-            start_ms,
-            end_ms,
-            ?sample_rate,
-            "loading historic metric range"
-        );
-        let rows = backend.fetch_historic_range(T::table_name(), start_ms, end_ms, sample_rate)?;
-        self.load_rows::<T>(store, rows)
-    }
-
-    fn load_rows<T: PersistentMetric>(
-        &mut self,
-        store: &mut BufferStore,
-        rows: Vec<String>,
-    ) -> Result<(), String> {
-        for row in rows {
-            let fields: Vec<_> = row.split(',').collect();
-            if fields.len() < 2 {
+        let mut flushed_buffer_count = 0;
+        for (metric_id, codec) in &self.codecs {
+            let watermark = *self.flush_watermarks.get(metric_id).unwrap_or(&0);
+            let samples = store.samples_since(*metric_id, watermark);
+            if samples.is_empty() {
                 continue;
             }
-            let timestamp_ms = fields[0]
-                .parse::<i64>()
-                .map_err(|error| error.to_string())?;
-            store.push_sample(MetricSample {
-                timestamp_ms,
-                data: T::from_sql_row(&fields[1..])?,
-            });
+
+            let rows: Vec<Vec<String>> = samples
+                .iter()
+                .filter_map(|(timestamp, data)| (codec.encode_row)(*timestamp, data.as_ref()))
+                .collect();
+            if rows.is_empty() {
+                continue;
+            }
+
+            let high_watermark = samples
+                .iter()
+                .map(|(timestamp, _)| *timestamp)
+                .max()
+                .unwrap_or(watermark);
+
+            self.backend
+                .flush_batch(codec.table, codec.columns, &rows)?;
+            self.flush_watermarks.insert(*metric_id, high_watermark);
+            flushed_buffer_count += 1;
         }
-        Ok(())
+
+        self.last_flush_timestamp_ms = timestamp_ms;
+        info!(flushed_buffer_count, "metric storage flush completed");
+
+        Ok(flushed_buffer_count)
     }
-
-    // Flushes new persistent samples to the backend when the configured
-    // interval has elapsed.
-    // pub fn flush(
-    //     &mut self,
-    //     store: &mut BufferStore,
-    //     timestamp_ms: i64,
-    //     backend: &mut dyn StorageBackend,
-    // ) -> Result<(), String> {
-    //     if timestamp_ms - self.last_flush_timestamp_ms < self.flush_interval_ms {
-    //         return Ok(());
-    //     }
-
-    //     info!(
-    //         timestamp_ms,
-    //         previous_flush_timestamp_ms = self.last_flush_timestamp_ms,
-    //         codec_count = self.codecs.len(),
-    //         "flushing metric buffers to persistent storage"
-    //     );
-    //     let mut flushed_buffer_count = 0;
-    //     for (metric_id, codec) in &self.codecs {
-    //         let watermark = *self.flush_watermarks.get(metric_id).unwrap_or(&0);
-    //         let samples = store.samples_since(*metric_id, watermark);
-    //         if samples.is_empty() {
-    //             continue;
-    //         }
-    //         flushed_buffer_count += 1;
-
-    //         let rows: Vec<Vec<String>> = samples
-    //             .iter()
-    //             .filter_map(|(timestamp, data)| (codec.encode_row)(*timestamp, data.as_ref()))
-    //             .collect();
-    //         let high_watermark = samples
-    //             .iter()
-    //             .map(|(timestamp, _)| *timestamp)
-    //             .max()
-    //             .unwrap_or(watermark);
-
-    //         backend.flush_batch(codec.table, codec.columns, &rows)?;
-    //         self.flush_watermarks.insert(*metric_id, high_watermark);
-    //     }
-
-    //     self.last_flush_timestamp_ms = timestamp_ms;
-    //     info!(flushed_buffer_count, "metric storage flush completed");
-
-    //     Ok(())
-    // }
 }
+
+#[cfg(test)]
+mod tests;

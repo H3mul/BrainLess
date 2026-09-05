@@ -3,7 +3,6 @@ use tracing::{debug, info};
 
 /// DuckDB adapter boundary. A production application can replace the simple
 /// connection handle with duckdb::Connection without changing the engine.
-
 pub struct DuckDbStorageBackend {
     pub database_path: String,
     pub flushed_rows: usize,
