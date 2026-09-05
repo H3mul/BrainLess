@@ -1,11 +1,14 @@
 use crate::db::backend::StorageBackend;
 use crate::db::persistence::PersistenceDriver;
-use crate::engine::buffer_store::{BufferStore, MetricSnapshot};
+use crate::engine::buffer_store::{BufferStore, TickResult, TimeSeriesView};
+use crate::engine::core::requested_history_ms;
 use crate::execution::dependency_graph::DependencyGraph;
 use crate::execution::tick_executor::TickExecutor;
 use crate::{Metric, MetricEngine, MetricId, MetricSample};
 
-use std::collections::HashSet;
+use arc_swap::ArcSwap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
@@ -41,6 +44,16 @@ pub struct LiveSession {
     store: BufferStore,
     executor: TickExecutor,
     persistence: PersistenceDriver,
+    /// Result of the most recent tick: newest committed sample per metric,
+    /// published once per tick after all evaluators have fired, so
+    /// cross-thread readers always observe a tick-consistent view.
+    last_tick: ArcSwap<TickResult>,
+    /// Per-metric in-memory retention window in milliseconds. Samples older
+    /// than the tick timestamp minus this window are evicted on every tick.
+    /// Floor is twice the flush interval so unflushed
+    /// samples always survive at least one full flush opportunity; raised to
+    /// the configured buffer size and any evaluator-demanded history.
+    retention_ms: HashMap<MetricId, i64>,
 }
 
 impl LiveSession {
@@ -91,51 +104,87 @@ impl LiveSession {
             }
         }
 
+        // Retention floor of twice the flush interval guarantees a sample
+        // stays in memory across one missed flush opportunity before it can
+        // be evicted.
+        let flush_safety_ms = config.flush_interval_ms.saturating_mul(2);
+        let retention_ms = plan
+            .plan_metrics
+            .iter()
+            .map(|&metric_id| {
+                let retention = flush_safety_ms
+                    .max(config.buffer_size_ms)
+                    .max(requested_history_ms(&plan.aggregate_demand, metric_id));
+                (metric_id, retention)
+            })
+            .collect();
+
         Ok(Self {
             config,
             store,
             executor: TickExecutor::new(plan),
             persistence,
+            last_tick: ArcSwap::from_pointee(TickResult::default()),
+            retention_ms,
         })
     }
 
-    /// Add a metric to the store at the current timestamp.
-    pub fn push_live_metric<T: Metric>(&mut self, data: T) {
-        self.push_metric(current_timestamp(), data);
-    }
-
-    /// Add a metric to the store at the given timestamp.
+    /// Add a metric to the store at the given timestamp. Afterwards flushes
+    /// (if the interval elapsed) and evicts samples outside the retention
+    /// window, measured from the pushed timestamp.
     pub fn push_metric<T: Metric>(&mut self, timestamp_ms: i64, data: T) {
         self.store.push_sample(MetricSample { timestamp_ms, data });
     }
 
-    /// Add a metric to the store at the current timestamp and tick the executor immediately.
-    pub fn feed_live_metric<T: Metric>(&mut self, data: T) {
-        self.push_live_metric(data);
-        self.tick()
-    }
-
     /// Add a batch of metrics to the store at the current timestamp and tick the executor immediately.
-    pub fn feed_live_metric_batch<T: Metric>(&mut self, batch: Vec<T>) {
+    pub fn push_metric_batch<T: Metric>(&mut self, timestamp_ms: i64, batch: Vec<T>) {
         for metric in batch {
-            self.push_live_metric(metric);
+            self.store.push_sample(MetricSample {
+                timestamp_ms,
+                data: metric,
+            });
         }
-        self.tick()
-    }
-
-    /// Tick the executor at the current timestamp.
-    pub fn tick(&mut self) {
-        self.tick_at(current_timestamp())
     }
 
     /// Tick the executor at the given timestamp, then flush buffers to the
-    /// persistent backend if the flush interval has elapsed. Flush failures
-    /// are logged and retried on a later flush; watermarks stay untouched so
-    /// no samples are lost.
-    fn tick_at(&mut self, timestamp_ms: i64) {
+    /// persistent backend (if the flush interval elapsed) and evict samples
+    /// outside the retention window. Once all evaluators have fired and
+    /// maintenance ran, publishes a fresh [`TickResult`] and returns it: the
+    /// pointer is cheap to hand to other threads, and readers can also load
+    /// the newest publication at any time via [`LiveSession::last_tick`].
+    /// Flush failures are logged and retried on a later flush; watermarks
+    /// stay untouched so no samples are lost.
+    pub fn tick(&mut self, timestamp_ms: i64) -> Arc<TickResult> {
         self.executor.tick(timestamp_ms, &mut self.store);
-        if let Err(error) = self.persistence.maybe_flush(&mut self.store, timestamp_ms) {
-            warn!(%error, timestamp_ms, "periodic flush failed; will retry");
+        self.maintain(timestamp_ms);
+        self.publish_tick_result()
+    }
+
+    /// Returns the most recently published [`TickResult`] at any time,
+    /// without mutating session state. The returned pointer stays valid and
+    /// immutable even while later ticks publish fresher results.
+    pub fn last_tick(&self) -> Arc<TickResult> {
+        self.last_tick.load_full()
+    }
+
+    /// Builds the newest-per-metric result and publishes it atomically.
+    fn publish_tick_result(&self) -> Arc<TickResult> {
+        let result = Arc::new(self.store.tick_result());
+        self.last_tick.store(Arc::clone(&result));
+        result
+    }
+
+    /// Flushes buffered samples to the persistent backend when due, then
+    /// evicts samples that fell outside their metric's retention window.
+    /// Flushing runs before eviction so nothing is dropped before it had at
+    /// least one flush opportunity.
+    fn maintain(&mut self, now_ts: i64) {
+        if let Err(error) = self.persistence.maybe_flush(&mut self.store, now_ts) {
+            warn!(%error, timestamp_ms = now_ts, "periodic flush failed; will retry");
+        }
+        for (&metric_id, &retention) in &self.retention_ms {
+            self.store
+                .evict_before(metric_id, now_ts.saturating_sub(retention));
         }
     }
 
@@ -146,14 +195,12 @@ impl LiveSession {
         self.persistence.flush(&mut self.store, current_timestamp())
     }
 
-    /// Returns a point-in-time immutable snapshot for the session's latest evaluated timestamp.
-    pub fn get_metric_snapshot(&self) -> MetricSnapshot {
-        self.get_metric_snapshot_at(current_timestamp())
-    }
-
-    /// Returns a point-in-time immutable snapshot captured at a specific timestamp.
-    pub fn get_metric_snapshot_at(&self, timestamp_ms: i64) -> MetricSnapshot {
-        MetricSnapshot::from_store(timestamp_ms, &self.store)
+    /// Captures a [`TimeSeriesView`] of every buffered metric's full retained
+    /// history on demand. Unlike the per-tick [`TickResult`], this deep-copies
+    /// the buffers at call time, so it is not free — but the returned view is
+    /// immutable and cross-thread safe while the session keeps mutating.
+    pub fn time_series(&self) -> Arc<TimeSeriesView> {
+        Arc::new(TimeSeriesView::from_store(current_timestamp(), &self.store))
     }
 }
 

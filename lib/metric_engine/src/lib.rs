@@ -7,7 +7,9 @@ pub(crate) mod test_fixtures;
 
 pub use db::backend::{NoopStorageBackend, StorageBackend};
 pub use db::persistence::{PersistenceDriver, PersistentMetric};
-pub use engine::buffer_store::{BufferStore, TimeSeriesBuffer};
+#[cfg(feature = "timescaledb")]
+pub use db::timescaledb_impl::TimescaleDbStorageBackend;
+pub use engine::buffer_store::{BufferStore, TickResult, TickSample, TimeSeriesBuffer};
 pub use engine::core::{
     Age, Metric, MetricDependency, MetricEvaluator, MetricGroup, MetricId, MetricSample,
     SampleRate, SampleRequest,

@@ -21,7 +21,7 @@ fn driver_with_store(
     let mut driver = PersistenceDriver::new(flush_interval_ms, Box::new(backend.clone()));
     let mut store = BufferStore::new();
     store.register_buffer::<TestDerived>(60_000, &HashSet::new());
-    driver.register_codec::<TestDerived>();
+    driver.register_metric::<TestDerived>();
     (driver, store)
 }
 
@@ -89,7 +89,7 @@ fn noop_backend_skips_flush() {
     let mut driver = PersistenceDriver::new(0, Box::new(NoopStorageBackend));
     let mut store = BufferStore::new();
     store.register_buffer::<TestDerived>(60_000, &HashSet::new());
-    driver.register_codec::<TestDerived>();
+    driver.register_metric::<TestDerived>();
 
     store.push_sample(sample(1_000, 1.0));
     assert_eq!(driver.flush(&mut store, 1_000).unwrap(), 0);

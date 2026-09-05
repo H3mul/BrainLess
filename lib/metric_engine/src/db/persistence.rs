@@ -30,7 +30,7 @@ pub trait PersistentMetric: Metric {
 /// Type-erased row encoder for one persistent metric type, registered at
 /// metric registration time so the flush loop can encode drained samples
 /// without knowing their concrete types.
-pub(crate) struct SampleCodec {
+pub(crate) struct ErasedPersistentMetric {
     pub table: &'static str,
     pub columns: &'static [&'static str],
     /// Encodes `(timestamp, data)` into backend row parameters; the data is
@@ -38,7 +38,7 @@ pub(crate) struct SampleCodec {
     pub encode_row: fn(i64, &(dyn Any + Send + Sync)) -> Option<Vec<String>>,
 }
 
-impl SampleCodec {
+impl ErasedPersistentMetric {
     pub(crate) fn of<T: PersistentMetric>() -> Self {
         Self {
             table: T::table_name(),
@@ -63,10 +63,10 @@ fn encode_sample<T: PersistentMetric>(
 /// rows and flushes them to the backend on a schedule.
 ///
 /// The buffer store stays storage agnostic; this type owns the backend, the
-/// flush watermarks, and the per-type row codecs.
+/// flush watermarks, and the per-type row persistent metrics.
 pub struct PersistenceDriver {
     backend: Box<dyn StorageBackend>,
-    codecs: HashMap<MetricId, SampleCodec>,
+    persistent_metrics: HashMap<MetricId, ErasedPersistentMetric>,
     flush_watermarks: HashMap<MetricId, i64>,
     last_flush_timestamp_ms: i64,
     flush_interval_ms: i64,
@@ -77,7 +77,7 @@ impl PersistenceDriver {
         debug!(flush_interval_ms, "initializing persistence driver");
         Self {
             backend,
-            codecs: HashMap::new(),
+            persistent_metrics: HashMap::new(),
             flush_watermarks: HashMap::new(),
             last_flush_timestamp_ms: 0,
             flush_interval_ms,
@@ -88,12 +88,13 @@ impl PersistenceDriver {
         self.flush_interval_ms
     }
 
-    /// Records the row codec for a persistent metric type so its buffered
+    /// Records the row persistent metric for a persistent metric type so its buffered
     /// samples can be encoded and flushed to the backend.
-    pub fn register_codec<T: PersistentMetric>(&mut self) {
+    pub fn register_metric<T: PersistentMetric>(&mut self) {
         let metric_id = MetricId::of::<T>();
-        debug!(metric_id = ?metric_id, "registering persistent metric codec");
-        self.codecs.insert(metric_id, SampleCodec::of::<T>());
+        debug!(metric_id = ?metric_id, "registering persistent metric");
+        self.persistent_metrics
+            .insert(metric_id, ErasedPersistentMetric::of::<T>());
     }
 
     /// Flushes new samples to the backend only when the configured interval
@@ -122,11 +123,11 @@ impl PersistenceDriver {
         info!(
             timestamp_ms,
             previous_flush_timestamp_ms = self.last_flush_timestamp_ms,
-            codec_count = self.codecs.len(),
+            metric_count = self.persistent_metrics.len(),
             "flushing metric buffers to persistent storage"
         );
         let mut flushed_buffer_count = 0;
-        for (metric_id, codec) in &self.codecs {
+        for (metric_id, persistent_metric) in &self.persistent_metrics {
             let watermark = *self.flush_watermarks.get(metric_id).unwrap_or(&0);
             let samples = store.samples_since(*metric_id, watermark);
             if samples.is_empty() {
@@ -135,7 +136,9 @@ impl PersistenceDriver {
 
             let rows: Vec<Vec<String>> = samples
                 .iter()
-                .filter_map(|(timestamp, data)| (codec.encode_row)(*timestamp, data.as_ref()))
+                .filter_map(|(timestamp, data)| {
+                    (persistent_metric.encode_row)(*timestamp, data.as_ref())
+                })
                 .collect();
             if rows.is_empty() {
                 continue;
@@ -148,7 +151,7 @@ impl PersistenceDriver {
                 .unwrap_or(watermark);
 
             self.backend
-                .flush_batch(codec.table, codec.columns, &rows)?;
+                .flush_batch(persistent_metric.table, persistent_metric.columns, &rows)?;
             self.flush_watermarks.insert(*metric_id, high_watermark);
             flushed_buffer_count += 1;
         }

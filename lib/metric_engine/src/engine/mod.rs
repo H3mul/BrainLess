@@ -84,9 +84,9 @@ impl MetricRegistration {
     pub fn persistent<T: PersistentMetric>() -> Self {
         Self {
             metric_id: MetricId::of::<T>(),
-            register: |store, driver, buffer_size_ms, demand| {
+            register: |store, persistence_driver, buffer_size_ms, demand| {
                 store.register_buffer::<T>(buffer_size_ms, demand);
-                driver.register_codec::<T>();
+                persistence_driver.register_metric::<T>();
                 Ok(())
             },
         }

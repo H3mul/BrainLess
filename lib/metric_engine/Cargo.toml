@@ -7,4 +7,9 @@ edition = "2021"
 path = "src/lib.rs"
 
 [dependencies]
+arc-swap = "1.9"
+postgres = { version = "0.19.14", optional = true }
 tracing = "0.1"
+
+[features]
+timescaledb = ["dep:postgres"]

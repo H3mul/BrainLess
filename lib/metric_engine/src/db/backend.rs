@@ -10,7 +10,8 @@ pub trait StorageBackend: Send + Sync {
     }
     /// Writes a batch of rows to a metric table.
     ///
-    /// Each row is the list of parameter values for `schema_columns`, in order.
+    /// Each row is the timestamp in milliseconds followed by the parameter
+    /// values for `schema_columns`, in order.
     fn flush_batch(
         &mut self,
         table_name: &str,

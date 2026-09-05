@@ -86,6 +86,56 @@ impl MetricEvaluator for DoublingEvaluator {
     }
 }
 
+/// Ephemeral aggregate produced from a 60-second source window; its window
+/// dependency is what should drive the source buffer's retention floor in
+/// tests.
+#[derive(Debug, Clone)]
+pub struct TestAggMetric {
+    pub count: f64,
+}
+impl Metric for TestAggMetric {
+    fn id() -> &'static str {
+        "test_agg_metric"
+    }
+}
+
+/// Produces `TestAggMetric` holding the number of source samples in the
+/// last 60 seconds.
+pub struct WindowCountEvaluator;
+impl MetricEvaluator for WindowCountEvaluator {
+    type Output = TestAggMetric;
+
+    fn id() -> &'static str {
+        "window_count_evaluator"
+    }
+
+    fn dependencies(&self) -> HashSet<MetricDependency> {
+        HashSet::from([MetricDependency::window::<TestSource>(
+            60,
+            0,
+            SampleRate::Best,
+        )])
+    }
+
+    fn evaluate(
+        &self,
+        timestamp_ms: i64,
+        store: &ReadOnlyBufferStore,
+    ) -> Result<Self::Output, String> {
+        let count = store
+            .get_buffer::<TestSource>()
+            .map(|buffer| {
+                buffer
+                    .get_samples_in_ts_window(timestamp_ms - 60_000, timestamp_ms)
+                    .len()
+            })
+            .unwrap_or(0);
+        Ok(TestAggMetric {
+            count: count as f64,
+        })
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct RecordingState {
     pub flushes: Vec<RecordedFlush>,

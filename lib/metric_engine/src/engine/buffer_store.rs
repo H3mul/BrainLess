@@ -131,6 +131,12 @@ pub trait ErasedTimeSeriesBuffer: Send + Sync {
     /// unflushed samples without knowing `T`.
     fn samples_since(&self, watermark_ts: i64) -> Vec<(i64, Arc<dyn Any + Send + Sync>)>;
 
+    /// `(timestamp, value)` of the newest retained sample, type-erased.
+    fn latest_sample(&self) -> Option<TickSample>;
+
+    /// Drops all samples older than `timestamp_ms`.
+    fn evict_samples_before_ts(&mut self, timestamp_ms: i64);
+
     fn clone_erased(&self) -> Box<dyn ErasedTimeSeriesBuffer>;
 }
 
@@ -174,6 +180,19 @@ impl<T: Metric> ErasedTimeSeriesBuffer for TimeSeriesBuffer<T> {
                 )
             })
             .collect()
+    }
+
+    fn latest_sample(&self) -> Option<TickSample> {
+        self.samples.back().map(|sample| TickSample {
+            timestamp_ms: sample.timestamp_ms,
+            value: Arc::new(sample.data.clone()) as _,
+            type_name: std::any::type_name::<T>(),
+            debug: format!("{:?}", sample.data),
+        })
+    }
+
+    fn evict_samples_before_ts(&mut self, timestamp_ms: i64) {
+        TimeSeriesBuffer::evict_samples_before_ts(self, timestamp_ms)
     }
 
     fn clone_erased(&self) -> Box<dyn ErasedTimeSeriesBuffer> {
@@ -314,24 +333,115 @@ impl BufferStore {
             .unwrap_or_default()
     }
 
+    /// Drops all samples older than `timestamp_ms` for a metric. No-op when
+    /// the metric has no registered buffer.
+    pub fn evict_before(&mut self, metric_id: MetricId, timestamp_ms: i64) {
+        if let Some(buffer) = self.buffers.get_mut(&metric_id) {
+            buffer.evict_samples_before_ts(timestamp_ms);
+        }
+    }
+
     /// Whether a buffer is registered for the metric type.
     pub fn has_buffer(&self, metric_id: MetricId) -> bool {
         self.buffers.contains_key(&metric_id)
     }
+
+    /// Collects the newest sample of every buffered metric into a
+    /// [`TickResult`], ready for cross-thread publication.
+    pub fn tick_result(&self) -> TickResult {
+        let mut values = HashMap::new();
+        for (&metric_id, buffer) in self.buffers_iter() {
+            if let Some(latest) = buffer.latest_sample() {
+                values.insert(metric_id, latest);
+            }
+        }
+        TickResult { values }
+    }
 }
 
-pub struct MetricSnapshot {
+/// A single type-erased sample from one tick result: the value for typed
+/// downcast plus the concrete type's name and `Debug` rendering, captured at
+/// build time so the result can be printed without knowing metric types.
+pub struct TickSample {
     pub timestamp_ms: i64,
-    // Storage maps MetricId to an Arc reference of the vector slice
+    value: Arc<dyn Any + Send + Sync>,
+    pub type_name: &'static str,
+    pub debug: String,
+}
+
+/// Tick-consistent result of one tick: the newest committed sample per
+/// metric, published once per tick after all evaluators have fired.
+///
+/// Cheap to publish (one map build per tick, values shared via `Arc`) and
+/// safe to hand across threads. Consumers downcast through
+/// [`TickResult::get`]; for full time-series introspection use
+/// [`TimeSeriesView`], built on demand instead of every tick.
+#[derive(Default)]
+pub struct TickResult {
+    values: HashMap<MetricId, TickSample>,
+}
+
+impl TickResult {
+    /// Returns the newest `(timestamp, value)` for a metric type.
+    pub fn get<T: Metric>(&self) -> Option<(i64, Arc<T>)> {
+        let sample = self.values.get(&MetricId::of::<T>())?;
+        Some((
+            sample.timestamp_ms,
+            sample.value.clone().downcast::<T>().ok()?,
+        ))
+    }
+
+    /// Whether the result holds any values at all.
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    /// Number of metrics present in the result.
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+}
+
+/// One line per metric, sorted by metric type name so repeated tick results
+/// diff cleanly.
+impl std::fmt::Display for TickResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut sections: Vec<&TickSample> = self.values.values().collect();
+        sections.sort_by_key(|sample| sample.type_name);
+
+        for sample in sections {
+            writeln!(
+                formatter,
+                "  {} @ {}: {}",
+                sample.type_name, sample.timestamp_ms, sample.debug
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for TickResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "TickResult({} metrics):\n{self}", self.len())
+    }
+}
+
+/// Read view over the full retained time series of every buffered metric,
+/// captured on demand (unlike the per-tick [`TickResult`]). Deep-copies the
+/// buffers at capture time, so the view stays immutable and cross-thread
+/// safe while the session keeps mutating its store.
+///
+/// `Box<dyn ErasedTimeSeriesBuffer>` is `Send + Sync` by trait bound and
+/// metric values are `Send + Sync` via [`Metric`], so the view crosses
+/// threads without unsafe impls.
+pub struct TimeSeriesView {
+    /// Timestamp the view was captured at.
+    pub timestamp_ms: i64,
     buffers: HashMap<MetricId, Box<dyn ErasedTimeSeriesBuffer>>,
 }
 
-// Guaranteed safe to pass across threads (e.g., to async UI or storage tasks)
-unsafe impl Send for MetricSnapshot {}
-unsafe impl Sync for MetricSnapshot {}
-
-impl MetricSnapshot {
-    /// Constructs an immutable, borrow-free snapshot of the current BufferStore state.
+impl TimeSeriesView {
+    /// Constructs an immutable, borrow-free view of the current BufferStore state.
     pub fn from_store(timestamp_ms: i64, store: &BufferStore) -> Self {
         let mut buffers = HashMap::default();
 
@@ -345,7 +455,7 @@ impl MetricSnapshot {
         }
     }
 
-    /// Read-only buffer accessor for downstream consumers.
+    /// Read-only full-history accessor for one metric type.
     #[inline]
     pub fn get_buffer<T: Metric>(&self) -> Option<&TimeSeriesBuffer<T>> {
         let metric_id = MetricId::of::<T>();
@@ -353,5 +463,29 @@ impl MetricSnapshot {
             .get(&metric_id)?
             .as_any()
             .downcast_ref::<TimeSeriesBuffer<T>>()
+    }
+}
+
+/// Human-readable ledger dump: one section per buffered metric, samples in
+/// chronological order. Section order is sorted by metric type name so
+/// repeated views diff cleanly.
+impl std::fmt::Display for TimeSeriesView {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(formatter, "TimeSeriesView @ {}:", self.timestamp_ms)?;
+
+        let mut sections: Vec<(&str, Vec<(i64, String)>)> = self
+            .buffers
+            .values()
+            .map(|buffer| (buffer.type_name(), buffer.debug_rows()))
+            .collect();
+        sections.sort_by_key(|(type_name, _)| *type_name);
+
+        for (type_name, rows) in sections {
+            writeln!(formatter, "  {type_name} ({} samples):", rows.len())?;
+            for (timestamp_ms, value) in rows {
+                writeln!(formatter, "    {timestamp_ms}: {value}")?;
+            }
+        }
+        Ok(())
     }
 }
